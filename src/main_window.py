@@ -57,10 +57,12 @@ class ScreenView(QWidget):
         self._pixmap: QPixmap | None = None
         self._has_frame = False
         self._placeholder_text = (
-            "Searching for iPhone…\n\n"
-            "• Same WiFi network\n"
-            "• Developer Mode on\n"
-            "• pymobiledevice3 remote tunneld"
+            "Zoeken naar iPhone…\n\n"
+            "Als hij niet gevonden wordt:\n"
+            "• Zelfde WiFi als je Mac\n"
+            "• Developer Mode aan\n"
+            "• Gepaird via USB (eenmalig)\n"
+            "• iPhone even ontgrendelen"
         )
 
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -117,6 +119,12 @@ class ScreenView(QWidget):
         self._has_frame = False
         self._pixmap = None
         self.update()
+
+    def set_placeholder(self, text: str) -> None:
+        """Update the message shown while no iPhone frame is available."""
+        self._placeholder_text = text
+        if not self._has_frame:
+            self.update()
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton and self._has_frame:
@@ -425,11 +433,42 @@ class MainWindow(QMainWindow):
                 try:
                     devices = await self.device_manager.list_available_devices()
                     self.device_manager._last_devices = devices
+                    # If not connected yet, keep the placeholder informative.
+                    if not self._connected:
+                        self._update_search_placeholder(devices)
                 except Exception as e:
                     logger.debug("Device refresh failed: %s", e)
                 await asyncio.sleep(3.0)
         except asyncio.CancelledError:
             pass
+
+    def _update_search_placeholder(self, devices: list[dict]) -> None:
+        preferred = QSettings("iPhoneMirroring", "iPhoneMirror").value(
+            "device/preferred_udid", "", type=str
+        )
+        if not devices:
+            self.screen_view.set_placeholder(
+                "Zoeken naar iPhone…\n\n"
+                "Geen device gevonden.\n\n"
+                "Als hij niet verschijnt:\n"
+                "• Zelfde WiFi als je Mac\n"
+                "• Developer Mode aan\n"
+                "• Kabel er even in (Trust popup)"
+            )
+            self._status_label.setText("Geen iPhone gevonden")
+            return
+        if preferred and not any(d["udid"] == preferred for d in devices):
+            names = ", ".join(d.get("name", "iPhone") for d in devices)
+            self.screen_view.set_placeholder(
+                "Voorkeurs-iPhone offline\n\n"
+                f"Gevonden: {names}\n"
+                "Kies ⚙ → iPhone kiezen"
+            )
+            self._status_label.setText(f"{len(devices)} device(s), voorkeur offline")
+            return
+        # We have a matching device — tunnel is still opening.
+        self.screen_view.set_placeholder("Tunnel opzetten…")
+        self._status_label.setText("Tunnel opzetten…")
 
     async def async_close(self) -> None:
         """Async teardown called from the signal handler / close event."""
@@ -625,7 +664,35 @@ class MainWindow(QMainWindow):
         self.device_manager.device_disconnected.connect(self._on_device_disconnected)
         self.device_manager.connection_error.connect(self._on_connection_error)
         self.device_manager.connection_state_changed.connect(self._on_state_changed)
+        self.device_manager.tunnel_status_changed.connect(self._on_tunnel_status)
         self.input_handler.wda_status_changed.connect(self._on_wda_status)
+
+    def _on_tunnel_status(self, status: str, reason: str) -> None:
+        if status == "lost":
+            self._status_label.setText(f"Tunnel weg — reconnect… ({reason[:30]})")
+            self.screen_view.set_placeholder(
+                "Verbinding verloren\n\n"
+                "Automatisch aan het reconnecten…\n\n"
+                f"Reden: {reason[:60]}"
+            )
+            self.screen_view.show_disconnected()
+            self._stop_capture()
+            self._wda_retry_timer.stop()
+            self._keepalive_timer.stop()
+        elif status == "reconnecting":
+            self._status_label.setText(f"Reconnect… ({reason[:40]})")
+            self.screen_view.set_placeholder(f"Reconnecten…\n\n{reason}")
+        elif status == "reconnected":
+            self._status_label.setText("Reconnected — capture herstart")
+            self._start_capture()
+            self._start_wda_auto()
+        elif status == "failed":
+            self._status_label.setText("Reconnect mislukt — check iPhone/WiFi")
+            self.screen_view.set_placeholder(
+                "Reconnect mislukt\n\n"
+                "Klik ↻ voor handmatige retry, of\n"
+                "steek de kabel er even in."
+            )
 
     def _on_device_connected(self, info: dict):
         if self._connected:

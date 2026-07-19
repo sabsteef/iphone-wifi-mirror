@@ -4,12 +4,14 @@ Mirror en bedien je iPhone-scherm vanaf macOS over WiFi. Alternatief voor Apple'
 
 ## Features
 
-- WiFi screen mirroring via pymobiledevice3
-- Touch control (tap, swipe, scroll) via WebDriverAgent
-- Home / Lock / Volume / Unlock (met opgeslagen passcode via Keychain)
-- iPhone-vormig frameless venster met bezel
-- Tunnel service auto start/stop met de app (na éénmalige setup)
-- Passwordless na installatie (via sudoers regel)
+- WiFi screen mirroring via pymobiledevice3 v9 **userspace tunnel — geen sudo, geen LaunchDaemon**
+- Auto-reconnect met health monitoring — WiFi drops worden automatisch opgevangen
+- Touch control (tap, swipe, scroll, pinch) via WebDriverAgent met Bearer token auth
+- Home / Lock / Volume / Unlock (met opgeslagen passcode via macOS Keychain)
+- Toetsenbord naar iPhone (tekstvelden, arrow keys, Enter, etc.)
+- iPhone-vormig frameless venster met bezel + Dynamic Island
+- Device detectie: friendly name + juiste screen size per iPhone model
+- MJPEG stream met hardware JPEG encoding (~10 FPS met tunable kwaliteit)
 
 ## Prerequisites
 
@@ -84,14 +86,9 @@ pymobiledevice3 apps install \
 ./run.sh
 ```
 
-Bij de eerste start:
-- App detecteert dat de tunnel service niet draait
-- Vraagt "Installeer tunnel service?" → klik **Yes**
-- macOS vraagt éénmalig je admin wachtwoord
-- Installeert LaunchDaemon plist + sudoers regel + pymobiledevice3 in system Python
-- Start de tunnel
+**Geen sudo, geen tunnel service, niks te installeren.** De app opent zijn eigen userspace tunnel in-process. Zodra je iPhone gevonden wordt via usbmux, verbindt hij automatisch en start MJPEG capture.
 
-**Vanaf nu:** tunnel start/stopt automatisch met de app, zonder wachtwoord.
+Als de WiFi tunnel valt: health monitor detecteert het binnen ~6s en herverbindt automatisch met exponential backoff.
 
 ## Gebruik
 
@@ -100,10 +97,12 @@ Bij de eerste start:
 - **Unlock** (🔓 / Ctrl+U): scherm wekken + passcode invoeren
 - **Vol+/−**: volume
 - **↻**: herverbind met device
-- **⚙**: settings — passcode + service beheer
-- **Drag**: sleep het venster aan de bezel
+- **⚙**: settings — passcode + device selectie
+- **Drag**: sleep het venster aan de bezel (positie wordt onthouden)
 - **Klik in scherm**: tap wordt doorgestuurd naar iPhone
-- **Scroll/swipe**: doorgestuurd als swipe gesture
+- **Scroll**: 2-vinger trackpad = swipe (met inertia)
+- **Cmd + Scroll**: pinch-to-zoom (Foto's, Maps, Safari)
+- **Toetsenbord**: type direct in iPhone tekstvelden
 
 ## Passcode voor Unlock
 
@@ -113,16 +112,18 @@ Wordt bewaard in macOS Keychain per device UDID. Wordt gebruikt door de Unlock k
 
 ## Troubleshooting
 
-### Tunnel start niet
-
-- Check log: `cat /var/log/iphonemirror-tunneld.log`
-- Handmatig testen: `sudo pymobiledevice3 remote tunneld`
-
 ### iPhone niet gevonden
 
-- Zit iPhone op dezelfde WiFi?
+- Zit iPhone op dezelfde WiFi als je Mac?
 - Developer Mode aan? (Settings → Privacy & Security → Developer Mode)
 - iPhone gepaird? `pymobiledevice3 usbmux list`
+- **Bij herhaalde issues**: kabel er even in, "Vertrouw deze computer" popup accepteren, dan kabel eruit — WiFi discovery wordt daarmee gereset.
+
+### Tunnel drops steeds
+
+- Check log — je zou "Tunnel lost" / "Reconnecting" moeten zien
+- Als de auto-reconnect na 6 pogingen faalt: klik ↻ voor handmatig
+- iOS 27 WiFi kan flaky zijn — pymobiledevice3 v9.36+ heeft hier fixes voor
 
 ### WDA connect faalt
 
@@ -133,7 +134,8 @@ Wordt bewaard in macOS Keychain per device UDID. Wordt gebruikt door de Unlock k
 ### FPS laag
 
 - Screen capture draait in subprocess om GIL-contention te vermijden
-- Verwachte FPS: 2-9 (afhankelijk van WiFi + Mac CPU)
+- Verwachte FPS: 6-12 (afhankelijk van WiFi + Mac CPU)
+- Tune in [src/device_manager.py](src/device_manager.py) — de env vars `MJPEG_SERVER_SCREENSHOT_QUALITY`, `MJPEG_SCALING_FACTOR`, `MJPEG_SERVER_FRAMERATE`
 - Zie [FINDINGS.md](FINDINGS.md) voor details
 
 ## Verwijderen
@@ -142,17 +144,30 @@ Wordt bewaard in macOS Keychain per device UDID. Wordt gebruikt door de Unlock k
 ./uninstall.sh
 ```
 
-Verwijdert de tunnel service, sudoers regel en (optioneel) de venv. pymobiledevice3 in system Python blijft staan.
+Verwijdert de venv (en eventuele legacy v7 tunnel service). Geen sudo nodig tenzij v7 residu opgeruimd moet worden.
 
 ## Architectuur
 
+- **main.py** — qasync bootstrap, PyQt event loop
 - **src/main_window.py** — PyQt6 UI met frameless iPhone-vorm
-- **src/device_manager.py** — pymobiledevice3 wrapper, tunnel discovery, DVT
-- **src/screen_capture.py** — capture thread met subprocess worker
-- **src/capture_worker.py** — losstaand DVT capture proces
+- **src/tunnel_manager.py** — userspace tunnel + health monitor + auto-reconnect
+- **src/device_manager.py** — async device discovery + WDA lifecycle
+- **src/screen_capture.py** — MJPEG worker orchestration + DVT fallback
+- **src/mjpeg_capture_worker.py** — losstaand MJPEG stream reader
+- **src/capture_worker.py** — losstaand DVT screenshot proces (async, v9)
 - **src/input_handler.py** — WebDriverAgent HTTP client (touch/keys)
-- **src/tunnel_manager.py** — LaunchDaemon installer, service start/stop
 - **src/passcode_store.py** — macOS Keychain wrapper voor passcode
+- **src/wda_auth.py** — WDA bearer token generatie/storage
+- **src/device_models.py** — ProductType → friendly name + screen size
+
+## Tests
+
+```bash
+source .venv/bin/activate
+pytest tests/
+```
+
+Unit tests dekken TunnelManager (health monitoring, reconnect, backoff) en DeviceManager (device selectie, signal emission). Draaien zonder iPhone — regressie preventie.
 
 ## License
 
@@ -160,7 +175,11 @@ MIT (zie LICENSE)
 
 ## Roadmap
 
-- [ ] `.app` bundle met PyInstaller
+- [x] Multi-device support (Settings → iPhone kiezen)
+- [x] Userspace tunnel (geen sudo, geen LaunchDaemon)
+- [x] Auto-reconnect met health monitoring
+- [x] Test suite voor regressie preventie
+- [ ] `.app` bundle met PyInstaller voor `/Applications`
 - [ ] Homebrew Cask voor eenvoudige install
 - [ ] Automatische WDA bouw via install script (met Apple Developer prompt)
-- [ ] Multi-device support (kies iPhone uit lijst)
+- [ ] Valeria protocol support (als community die reverse-engineered) voor 60 FPS hardware VNC

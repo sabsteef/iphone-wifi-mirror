@@ -32,7 +32,14 @@ from PyQt6.QtCore import QObject, pyqtSignal
 from pymobiledevice3.remote.remote_service_discovery import RemoteServiceDiscoveryService
 from pymobiledevice3.usbmux import list_devices as usbmux_list_devices
 
-from src.tunnel_manager import TunnelManager
+from src.tunnel_manager import (
+    STATUS_CONNECTED,
+    STATUS_FAILED,
+    STATUS_LOST,
+    STATUS_RECONNECTED,
+    STATUS_RECONNECTING,
+    TunnelManager,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +56,7 @@ class DeviceManager(QObject):
     device_disconnected = pyqtSignal()
     connection_error = pyqtSignal(str)
     connection_state_changed = pyqtSignal(ConnectionState)
+    tunnel_status_changed = pyqtSignal(str, str)  # (status, reason)
 
     WDA_BUNDLE_ID = "com.sabsteef.WebDriverAgentRunner.xctrunner"
     DISCOVERY_INTERVAL_S = 2.0
@@ -57,6 +65,7 @@ class DeviceManager(QObject):
         super().__init__(parent)
         self._state = ConnectionState.DISCONNECTED
         self._tunnel_mgr = TunnelManager()
+        self._tunnel_mgr.on_status_change(self._on_tunnel_status)
         self._current_udid: Optional[str] = None
         self._device_info: dict = {}
         self._wda_proc: Optional[subprocess.Popen] = None
@@ -278,6 +287,30 @@ class DeviceManager(QObject):
 
     def is_wda_running(self) -> bool:
         return self._wda_proc is not None and self._wda_proc.poll() is None
+
+    # ────────────────────────────── tunnel status ────────────────────────────
+
+    def _on_tunnel_status(self, status: str, reason: str) -> None:
+        """Called by TunnelManager on connect/lost/reconnecting/failed events.
+
+        Not a coroutine; runs on the qasync loop from TunnelManager._emit().
+        Forwarded to Qt signal so UI can react.
+        """
+        self.tunnel_status_changed.emit(status, reason)
+
+        if status == STATUS_LOST:
+            logger.warning("Tunnel lost: %s — killing WDA until reconnect", reason)
+            self.stop_wda()
+            if self._state == ConnectionState.CONNECTED:
+                self._set_state(ConnectionState.CONNECTING)
+        elif status == STATUS_RECONNECTED:
+            logger.info("Tunnel reconnected: %s", reason)
+            self._set_state(ConnectionState.CONNECTED)
+            self.device_connected.emit(self._device_info)
+        elif status == STATUS_FAILED:
+            logger.error("Tunnel gave up reconnecting: %s", reason)
+            self._set_state(ConnectionState.ERROR)
+            self.connection_error.emit(f"Tunnel dropped and could not recover: {reason}")
 
     # ────────────────────────────── shutdown ─────────────────────────────────
 
