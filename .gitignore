@@ -22,7 +22,7 @@ dist/
 *.swp
 
 # App-generated
-run.sh
+
 /tmp/
 *.log
 
