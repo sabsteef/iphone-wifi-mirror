@@ -1,12 +1,38 @@
+"""Async device discovery + connect + WDA lifecycle for v9.
+
+Replaces the v7 sync/threaded manager. All pymobiledevice3 interaction is
+awaited on the qasync loop so the Qt UI stays responsive.
+
+Responsibilities:
+    * Poll usbmux for connected devices (WiFi and USB).
+    * Filter by user's preferred UDID (from :class:`InputHandler` UI / QSettings).
+    * Ask :class:`TunnelManager` to open a userspace tunnel to the selected device.
+    * Populate ``device_info`` (name / model / iOS / connection type).
+    * Manage the WDA xcuitest runner subprocess (start / stop, own process
+      group so SIGTERM to the app tears it down cleanly).
+
+Screen capture and touch input read ``rsd`` / ``get_wda_url()`` from us and go
+straight to the device — we don't proxy those calls.
+"""
+
+from __future__ import annotations
+
+import asyncio
 import logging
+import os
+import signal
 import subprocess
 import sys
-import threading
 import time
 from enum import Enum
 from typing import Optional
 
-from PyQt6.QtCore import QObject, QTimer, pyqtSignal
+from PyQt6.QtCore import QObject, pyqtSignal
+
+from pymobiledevice3.remote.remote_service_discovery import RemoteServiceDiscoveryService
+from pymobiledevice3.usbmux import list_devices as usbmux_list_devices
+
+from src.tunnel_manager import TunnelManager
 
 logger = logging.getLogger(__name__)
 
@@ -25,23 +51,21 @@ class DeviceManager(QObject):
     connection_state_changed = pyqtSignal(ConnectionState)
 
     WDA_BUNDLE_ID = "com.sabsteef.WebDriverAgentRunner.xctrunner"
+    DISCOVERY_INTERVAL_S = 2.0
 
-    def __init__(self, parent=None):
+    def __init__(self, parent: Optional[QObject] = None):
         super().__init__(parent)
         self._state = ConnectionState.DISCONNECTED
-        self._lockdown = None
-        self._dvt = None
-        self._rsd = None
-        self._screenshot_service = None
-        self._device_info: dict = {}
-        self._lock = threading.Lock()
+        self._tunnel_mgr = TunnelManager()
         self._current_udid: Optional[str] = None
+        self._device_info: dict = {}
         self._wda_proc: Optional[subprocess.Popen] = None
-        self._tunnel_address: Optional[str] = None
-        self._dev_image_mounted = False
+        self._preferred_udid: Optional[str] = None
+        self._discovery_task: Optional[asyncio.Task] = None
+        self._connect_task: Optional[asyncio.Task] = None
+        self._stop_discovery = asyncio.Event()
 
-        self._discovery_timer = QTimer(self)
-        self._discovery_timer.timeout.connect(self._poll_devices)
+    # ────────────────────────────── public state ─────────────────────────────
 
     @property
     def state(self) -> ConnectionState:
@@ -55,318 +79,150 @@ class DeviceManager(QObject):
     def is_connected(self) -> bool:
         return self._state == ConnectionState.CONNECTED
 
-    def start_discovery(self, interval_ms: int = 2000):
-        self._discovery_timer.start(interval_ms)
-        self._poll_devices()
+    @property
+    def rsd(self) -> Optional[RemoteServiceDiscoveryService]:
+        return self._tunnel_mgr.rsd
 
-    def stop_discovery(self):
-        self._discovery_timer.stop()
-
-    def _set_state(self, state: ConnectionState):
-        self._state = state
-        self.connection_state_changed.emit(state)
-
-    def _poll_devices(self):
-        if self.is_connected:
-            return
-        try:
-            devices = self._discover_devices()
-            if not devices:
-                return
-            best = self._pick_best_device(devices)
-            if best is None:
-                return
-            device_type, device = best
-            self._connect_in_background(device_type, device)
-        except Exception as e:
-            logger.debug("Discovery poll error: %s", e)
-
-    def set_preferred_udid(self, udid: str | None):
+    def set_preferred_udid(self, udid: Optional[str]) -> None:
         self._preferred_udid = udid or None
 
-    def _pick_best_device(self, devices: list) -> tuple | None:
-        preferred = getattr(self, "_preferred_udid", None)
-        tunnel_devs = [(t, d) for t, d in devices if t == "tunnel"]
-        if not tunnel_devs:
-            return None
-        if preferred:
-            for t, d in tunnel_devs:
-                if getattr(d, "udid", None) == preferred:
-                    return (t, d)
-            return None
-        return tunnel_devs[0]
+    def get_wda_url(self) -> str:
+        rsd = self._tunnel_mgr.rsd
+        if rsd is None or not rsd.service.address:
+            return "http://localhost:8100"
+        return f"http://[{rsd.service.address[0]}]:8100"
 
-    def list_available_devices(self) -> list[dict]:
+    # ────────────────────────────── discovery ────────────────────────────────
+
+    def start_discovery(self) -> None:
+        if self._discovery_task and not self._discovery_task.done():
+            return
+        self._stop_discovery.clear()
+        self._discovery_task = asyncio.ensure_future(self._discovery_loop())
+
+    def stop_discovery(self) -> None:
+        self._stop_discovery.set()
+        if self._discovery_task and not self._discovery_task.done():
+            self._discovery_task.cancel()
+
+    async def _discovery_loop(self) -> None:
         try:
-            devices = self._discover_devices()
-        except Exception:
+            while not self._stop_discovery.is_set():
+                if self._state != ConnectionState.CONNECTED and (
+                    self._connect_task is None or self._connect_task.done()
+                ):
+                    try:
+                        devices = await self.list_available_devices()
+                        best = self._pick_best(devices)
+                        if best is not None:
+                            self._connect_task = asyncio.ensure_future(
+                                self._connect(best["udid"])
+                            )
+                    except Exception as e:
+                        logger.debug("Discovery iteration error: %s", e)
+                try:
+                    await asyncio.wait_for(
+                        self._stop_discovery.wait(),
+                        timeout=self.DISCOVERY_INTERVAL_S,
+                    )
+                except asyncio.TimeoutError:
+                    continue
+        except asyncio.CancelledError:
+            pass
+        finally:
+            logger.debug("Discovery loop exited")
+
+    async def list_available_devices(self) -> list[dict]:
+        """Return every device usbmux/bonjour sees, USB + WiFi both."""
+        try:
+            devices = await usbmux_list_devices()
+        except Exception as e:
+            logger.debug("usbmux list failed: %s", e)
             return []
-        result = []
-        for device_type, device in devices:
-            if device_type != "tunnel":
+        result: list[dict] = []
+        for d in devices:
+            info = {"udid": getattr(d, "serial", "") or ""}
+            if not info["udid"]:
                 continue
-            info = {"udid": getattr(device, "udid", "")}
+            info["connection_type"] = getattr(d, "connection_type", "unknown")
+            info["name"] = getattr(d, "device_name", None) or "iPhone"
+            info["model"] = ""
+            info["ios"] = ""
             try:
-                info["name"] = device.get_value(key="DeviceName") or "iPhone"
+                props = getattr(d, "properties", {}) or {}
+                info["model"] = props.get("ProductType", "") or ""
+                info["ios"] = props.get("ProductVersion", "") or ""
             except Exception:
-                info["name"] = "iPhone"
-            try:
-                props = device.peer_info.get("Properties", {})
-                info["model"] = props.get("ProductType", "")
-                info["ios"] = props.get("OSVersion", "")
-            except Exception:
-                info["model"] = ""
-                info["ios"] = ""
+                pass
             result.append(info)
         return result
 
-    def _discover_devices(self) -> list:
-        found = []
+    def _pick_best(self, devices: list[dict]) -> Optional[dict]:
+        if not devices:
+            return None
+        if self._preferred_udid:
+            for d in devices:
+                if d["udid"] == self._preferred_udid:
+                    return d
+            return None
+        return devices[0]
 
-        try:
-            from pymobiledevice3.tunneld.api import get_tunneld_devices
-            tunneld_devices = get_tunneld_devices()
-            if tunneld_devices:
-                for td in tunneld_devices:
-                    found.append(("tunnel", td))
-                return found
-        except ImportError:
-            logger.debug("tunneld API not available")
-        except Exception as e:
-            logger.debug("Tunnel discovery failed: %s", e)
+    # ────────────────────────────── connect ──────────────────────────────────
 
-        try:
-            from pymobiledevice3.usbmux import list_devices
-            for device in list_devices():
-                conn = device.connection_type
-                found.append((conn.lower() if conn else "usb", device))
-        except Exception as e:
-            logger.debug("usbmux discovery failed: %s", e)
+    def _set_state(self, state: ConnectionState) -> None:
+        self._state = state
+        self.connection_state_changed.emit(state)
 
-        return found
-
-    def _connect_in_background(self, device_type: str, device):
-        if self._state == ConnectionState.CONNECTING:
+    async def _connect(self, udid: str) -> None:
+        if self._state == ConnectionState.CONNECTED and self._current_udid == udid:
             return
         self._set_state(ConnectionState.CONNECTING)
-        thread = threading.Thread(
-            target=self._connect, args=(device_type, device), daemon=True
-        )
-        thread.start()
-
-    def _connect(self, device_type: str, device):
         try:
-            if self._state == ConnectionState.CONNECTED:
-                return
-
-            if device_type == "tunnel":
-                self._connect_via_tunnel(device)
-            else:
-                udid = device.serial
-                self._connect_via_usbmux(udid)
-
-            self._mount_developer_image()
-
+            rsd = await self._tunnel_mgr.connect(udid)
+            self._current_udid = udid
+            self._device_info = {
+                "name": self._safe_get_value(rsd, "DeviceName", default="iPhone"),
+                "model": rsd.product_type,
+                "ios_version": rsd.product_version,
+                "udid": rsd.udid,
+                "connection_type": "tunnel",
+            }
             self._set_state(ConnectionState.CONNECTED)
             self.device_connected.emit(self._device_info)
             logger.info(
-                "Connected to %s (%s) via %s",
-                self._device_info.get("name", "iPhone"),
-                self._device_info.get("ios_version", "?"),
-                device_type,
+                "Connected to %s (%s, iOS %s)",
+                self._device_info["name"],
+                self._device_info["model"],
+                self._device_info["ios_version"],
             )
-
         except Exception as e:
-            logger.error("Connection failed: %s", e)
+            logger.error("Tunnel connect failed for %s: %s", udid, e)
             self._set_state(ConnectionState.ERROR)
             self.connection_error.emit(str(e))
 
-    def _connect_via_tunnel(self, tunnel_device):
-        self._rsd = tunnel_device
-        udid = getattr(tunnel_device, "udid", "tunnel")
-        self._current_udid = udid
-
+    def _safe_get_value(self, rsd, key: str, default: str = "") -> str:
         try:
-            addr = tunnel_device.service.address
-            self._tunnel_address = addr[0] if addr else None
+            v = rsd.get_value(key=key)
+            return v or default
         except Exception:
-            self._tunnel_address = None
+            return default
 
-        name = "iPhone"
-        model = "unknown"
-        ios_version = "unknown"
+    # ────────────────────────────── WDA lifecycle ────────────────────────────
 
-        try:
-            name = tunnel_device.get_value(key="DeviceName") or name
-        except Exception:
-            pass
-
-        try:
-            props = tunnel_device.peer_info.get("Properties", {})
-            model = props.get("ProductType", model)
-            ios_version = props.get("OSVersion", ios_version)
-            if name == "iPhone":
-                name = props.get("DeviceClass", name)
-        except Exception:
-            pass
-
-        try:
-            if model == "unknown":
-                model = getattr(tunnel_device, "product_type", model)
-            if ios_version == "unknown":
-                ios_version = getattr(tunnel_device, "product_version", ios_version)
-        except Exception:
-            pass
-
-        self._device_info = {
-            "name": name,
-            "model": model,
-            "ios_version": ios_version,
-            "udid": udid,
-            "connection_type": "tunnel (WiFi)",
-        }
-        logger.info("Connected via developer tunnel (tunnel addr: %s)", self._tunnel_address)
-
-    def _connect_via_usbmux(self, udid: str):
-        from pymobiledevice3.lockdown import create_using_usbmux
-
-        self._lockdown = create_using_usbmux(serial=udid)
-        self._current_udid = udid
-        self._device_info = {
-            "name": self._lockdown.get_value(key="DeviceName"),
-            "model": self._lockdown.get_value(key="ProductType"),
-            "ios_version": self._lockdown.product_version,
-            "udid": self._lockdown.identifier,
-            "connection_type": "usbmux",
-        }
-
-    def _connect_dvt_with_rsd(self, rsd):
-        from pymobiledevice3.services.dvt.dvt_secure_socket_proxy import (
-            DvtSecureSocketProxyService,
-        )
-        from pymobiledevice3.services.dvt.instruments.screenshot import Screenshot
-
-        self._dvt = DvtSecureSocketProxyService(lockdown=rsd)
-        self._dvt.__enter__()
-        self._screenshot_service = Screenshot(self._dvt)
-        logger.info("DVT screenshot service connected via RSD")
-
-    def _connect_dvt_tunnel(self):
-        from pymobiledevice3.services.dvt.dvt_secure_socket_proxy import (
-            DvtSecureSocketProxyService,
-        )
-        from pymobiledevice3.services.dvt.instruments.screenshot import Screenshot
-        from pymobiledevice3.tunneld.api import get_tunneld_devices
-
-        tunneld_devices = get_tunneld_devices()
-        if not tunneld_devices:
-            raise ConnectionError("No tunnel found. Start tunneld first.")
-
-        rsd = None
-        for device in tunneld_devices:
-            if hasattr(device, "udid") and device.udid == self._current_udid:
-                rsd = device
-                break
-        if rsd is None:
-            rsd = tunneld_devices[0]
-
-        self._rsd = rsd
-        self._dvt = DvtSecureSocketProxyService(lockdown=rsd)
-        self._dvt.__enter__()
-        self._screenshot_service = Screenshot(self._dvt)
-        logger.info("DVT screenshot service connected via tunnel")
-
-    def _connect_dvt_direct(self):
-        from pymobiledevice3.services.dvt.dvt_secure_socket_proxy import (
-            DvtSecureSocketProxyService,
-        )
-        from pymobiledevice3.services.dvt.instruments.screenshot import Screenshot
-
-        self._dvt = DvtSecureSocketProxyService(lockdown=self._lockdown)
-        self._dvt.__enter__()
-        self._screenshot_service = Screenshot(self._dvt)
-        logger.info("DVT screenshot service connected (direct)")
-
-    def take_screenshot(self) -> bytes:
-        if not self._screenshot_service:
-            self._ensure_dvt()
-        return self._screenshot_service.get_screenshot()
-
-    def _ensure_dvt(self):
-        if self._screenshot_service:
-            return
-        if self._rsd is not None:
-            self._connect_dvt_with_rsd(self._rsd)
-        else:
-            self._connect_dvt_tunnel()
-        logger.info("DVT screenshot service connected (on-demand)")
-
-    def get_battery_info(self) -> dict:
-        try:
-            if self._lockdown:
-                from pymobiledevice3.services.diagnostics import DiagnosticsService
-                diag = DiagnosticsService(self._lockdown)
-                battery = diag.get_battery()
-                return {
-                    "level": battery.get("CurrentCapacity", -1),
-                    "charging": battery.get("IsCharging", False),
-                }
-        except Exception as e:
-            logger.debug("Battery info failed: %s", e)
-        return {"level": -1, "charging": False}
-
-    def get_wda_url(self) -> str:
-        if self._tunnel_address:
-            return f"http://[{self._tunnel_address}]:8100"
-        return "http://localhost:8100"
-
-    def _mount_developer_image(self) -> bool:
-        if self._dev_image_mounted:
-            return True
-        if not self._current_udid or self._current_udid == "tunnel":
-            return False
-        try:
-            cmd = [
-                sys.executable, "-m", "pymobiledevice3",
-                "mounter", "auto-mount",
-                "--tunnel", self._current_udid,
-            ]
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=60,
-            )
-            if result.returncode == 0:
-                logger.info("Developer image mounted")
-                self._dev_image_mounted = True
-                return True
-            if "already mounted" in (result.stdout + result.stderr).lower():
-                logger.info("Developer image already mounted")
-                self._dev_image_mounted = True
-                return True
-            logger.warning("Developer image mount output: %s", result.stderr or result.stdout)
-            return result.returncode == 0
-        except subprocess.TimeoutExpired:
-            logger.error("Developer image mount timed out")
-            return False
-        except Exception as e:
-            logger.error("Developer image mount failed: %s", e)
-            return False
-
-    def start_wda(self, auth_token: str | None = None) -> bool:
+    def start_wda(self, auth_token: Optional[str] = None) -> bool:
         if self._wda_proc and self._wda_proc.poll() is None:
             logger.info("WDA already running")
             return True
-
-        if not self._current_udid or self._current_udid == "tunnel":
-            logger.warning("No device UDID for WDA")
+        if not self._current_udid:
+            logger.warning("No UDID selected — cannot start WDA")
             return False
 
-        logger.info("Starting WDA via xcuitest (device: %s)...", self._current_udid)
-
+        logger.info("Starting WDA via xcuitest (device %s)", self._current_udid)
         cmd = [
             sys.executable, "-m", "pymobiledevice3",
             "developer", "dvt", "xcuitest",
             self.WDA_BUNDLE_ID,
-            "--tunnel", self._current_udid,
+            "--udid", self._current_udid,
             "--env", "MJPEG_SERVER_SCREENSHOT_QUALITY=55",
             "--env", "MJPEG_SCALING_FACTOR=50",
             "--env", "MJPEG_SERVER_FRAMERATE=12",
@@ -377,28 +233,26 @@ class DeviceManager(QObject):
 
         try:
             self._wda_proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
             time.sleep(5)
-
             if self._wda_proc.poll() is not None:
-                output = self._wda_proc.stdout.read().decode()
-                logger.error("WDA xcuitest exited early: %s", output[-500:])
+                output = (self._wda_proc.stdout.read() or b"").decode(errors="replace")
+                logger.error("WDA exited early: %s", output[-500:])
                 self._wda_proc = None
                 return False
-
             logger.info("WDA xcuitest started (PID %d)", self._wda_proc.pid)
             return True
         except Exception as e:
             logger.error("Failed to start WDA: %s", e)
             return False
 
-    def stop_wda(self):
+    def stop_wda(self) -> None:
         if not self._wda_proc:
             return
-        import os
-        import signal
         proc = self._wda_proc
         try:
             pgid = os.getpgid(proc.pid)
@@ -413,8 +267,7 @@ class DeviceManager(QObject):
             proc.wait(timeout=3)
         except Exception:
             try:
-                pgid = os.getpgid(proc.pid)
-                os.killpg(pgid, signal.SIGKILL)
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             except Exception:
                 try:
                     proc.kill()
@@ -426,45 +279,16 @@ class DeviceManager(QObject):
     def is_wda_running(self) -> bool:
         return self._wda_proc is not None and self._wda_proc.poll() is None
 
-    def _handle_disconnect(self):
-        self.disconnect()
+    # ────────────────────────────── shutdown ─────────────────────────────────
+
+    async def disconnect(self) -> None:
+        self.stop_wda()
+        await self._tunnel_mgr.disconnect()
+        self._current_udid = None
+        self._device_info = {}
+        self._set_state(ConnectionState.DISCONNECTED)
         self.device_disconnected.emit()
 
-    def disconnect(self):
-        self.stop_wda()
-
-        with self._lock:
-            if self._dvt:
-                try:
-                    self._dvt.__exit__(None, None, None)
-                except Exception:
-                    pass
-                self._dvt = None
-                self._screenshot_service = None
-
-            if self._rsd:
-                try:
-                    import asyncio
-                    try:
-                        loop = asyncio.get_event_loop()
-                        if loop.is_running():
-                            loop.create_task(self._rsd.close())
-                        else:
-                            loop.run_until_complete(self._rsd.close())
-                    except RuntimeError:
-                        asyncio.run(self._rsd.close())
-                except Exception:
-                    pass
-                self._rsd = None
-
-            self._lockdown = None
-            self._current_udid = None
-            self._tunnel_address = None
-            self._device_info = {}
-
-        self._set_state(ConnectionState.DISCONNECTED)
-        logger.info("Disconnected from device")
-
-    def cleanup(self):
+    async def cleanup(self) -> None:
         self.stop_discovery()
-        self.disconnect()
+        await self.disconnect()

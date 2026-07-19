@@ -1,5 +1,6 @@
-pymobiledevice3==7.8.3
+pymobiledevice3>=9.35.0
 PyQt6>=6.6.0
 Pillow>=10.0.0
 requests>=2.31.0
 keyring>=25.0.0
+qasync>=0.27.0

@@ -1,5 +1,5 @@
+import asyncio
 import logging
-import threading
 
 from datetime import datetime
 
@@ -35,7 +35,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from src import device_models, passcode_store, tunnel_manager, wda_auth
+from src import device_models, passcode_store, wda_auth
 from src.device_manager import ConnectionState, DeviceManager
 from src.input_handler import InputHandler
 from src.screen_capture import ScreenCaptureThread
@@ -264,7 +264,6 @@ class SettingsDialog(QDialog):
 
         layout.addWidget(self._device_group())
         layout.addWidget(self._passcode_group())
-        layout.addWidget(self._service_group())
 
         close = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         close.rejected.connect(self.reject)
@@ -294,7 +293,7 @@ class SettingsDialog(QDialog):
         settings = QSettings("iPhoneMirroring", "iPhoneMirror")
         preferred = settings.value("device/preferred_udid", "", type=str)
 
-        available = self._device_manager.list_available_devices() if self._device_manager else []
+        available = getattr(self._device_manager, "_last_devices", []) if self._device_manager else []
         seen_udids = set()
         for d in available:
             udid = d.get("udid", "")
@@ -366,51 +365,6 @@ class SettingsDialog(QDialog):
 
         return group
 
-    def _service_group(self) -> QWidget:
-        group = QFrame()
-        group.setStyleSheet(
-            "QFrame { background: #1a1a1a; border-radius: 8px; padding: 8px; }"
-            "QLabel { color: #ccc; }"
-        )
-        layout = QVBoxLayout(group)
-
-        title = QLabel("Tunnel service")
-        title.setStyleSheet("font-weight: bold; font-size: 13px;")
-        layout.addWidget(title)
-
-        self._svc_status = QLabel()
-        self._svc_status.setStyleSheet("font-size: 11px; color: #888;")
-        layout.addWidget(self._svc_status)
-
-        row = QHBoxLayout()
-        self._btn_install = QPushButton("Installeren")
-        self._btn_install.clicked.connect(self._install)
-        self._btn_uninstall = QPushButton("Verwijderen")
-        self._btn_uninstall.clicked.connect(self._uninstall)
-        self._btn_start = QPushButton("Start")
-        self._btn_start.clicked.connect(self._start)
-        self._btn_stop = QPushButton("Stop")
-        self._btn_stop.clicked.connect(self._stop)
-        for b in (self._btn_install, self._btn_uninstall, self._btn_start, self._btn_stop):
-            row.addWidget(b)
-        layout.addLayout(row)
-
-        self._refresh_service_state()
-        return group
-
-    def _refresh_service_state(self):
-        installed = tunnel_manager.is_fully_installed()
-        running = tunnel_manager.is_tunneld_running()
-        parts = []
-        parts.append("Service: geïnstalleerd" if installed else "Service: niet geïnstalleerd")
-        parts.append("draait" if running else "gestopt")
-        self._svc_status.setText(" · ".join(parts))
-
-        self._btn_install.setEnabled(not installed)
-        self._btn_uninstall.setEnabled(installed)
-        self._btn_start.setEnabled(installed and not running)
-        self._btn_stop.setEnabled(installed and running)
-
     def _save_passcode(self):
         code = self._pc_input.text().strip()
         if code and not code.isdigit():
@@ -420,36 +374,6 @@ class SettingsDialog(QDialog):
             QMessageBox.information(self, "Opgeslagen", "Passcode opgeslagen in Keychain.")
         else:
             QMessageBox.warning(self, "Fout", "Kon passcode niet opslaan.")
-
-    def _install(self):
-        ok, err = tunnel_manager.install_service()
-        if not ok:
-            QMessageBox.warning(self, "Installatie mislukt", err)
-        self._refresh_service_state()
-
-    def _uninstall(self):
-        reply = QMessageBox.question(
-            self, "Verwijderen",
-            "Service en sudoers regel verwijderen?",
-        )
-        if reply != QMessageBox.StandardButton.Yes:
-            return
-        ok, err = tunnel_manager.uninstall_service()
-        if not ok:
-            QMessageBox.warning(self, "Verwijderen mislukt", err)
-        self._refresh_service_state()
-
-    def _start(self):
-        ok, err = tunnel_manager.start_service()
-        if not ok:
-            QMessageBox.warning(self, "Start mislukt", err)
-        self._refresh_service_state()
-
-    def _stop(self):
-        ok, err = tunnel_manager.stop_service()
-        if not ok:
-            QMessageBox.warning(self, "Stop mislukt", err)
-        self._refresh_service_state()
 
 
 class MainWindow(QMainWindow):
@@ -487,57 +411,39 @@ class MainWindow(QMainWindow):
         self._keepalive_timer.timeout.connect(self._keep_alive)
         self._keepalive_timer.setInterval(25000)
 
-        QTimer.singleShot(200, self._ensure_tunnel_and_discover)
+    async def start_async(self) -> None:
+        """Called after the qasync loop is running. Starts device discovery."""
+        self._status_label.setText("Zoeken naar iPhone…")
+        # DeviceManager owns the userspace tunnel — no external service needed.
+        self.device_manager.start_discovery()
+        # Poll available devices for the settings picker every few seconds.
+        self._devices_refresh_task = asyncio.ensure_future(self._refresh_devices_loop())
 
-    def _ensure_tunnel_and_discover(self):
-        self._started_tunnel = False
-        if tunnel_manager.is_tunneld_running():
-            self._status_label.setText("Tunnel actief")
-            self.device_manager.start_discovery()
-            return
+    async def _refresh_devices_loop(self) -> None:
+        try:
+            while True:
+                try:
+                    devices = await self.device_manager.list_available_devices()
+                    self.device_manager._last_devices = devices
+                except Exception as e:
+                    logger.debug("Device refresh failed: %s", e)
+                await asyncio.sleep(3.0)
+        except asyncio.CancelledError:
+            pass
 
-        if tunnel_manager.is_fully_installed():
-            self._status_label.setText("Tunnel starten…")
-            ok, err = tunnel_manager.start_service()
-            if ok:
-                self._started_tunnel = True
-                self._status_label.setText("Tunnel actief")
-                self.device_manager.start_discovery()
-            else:
-                self._status_label.setText("Tunnel start faalde")
-                QMessageBox.warning(
-                    self, "Tunnel start mislukt",
-                    f"{err}\n\nCheck /var/log/iphonemirror-tunneld.log",
-                )
-            return
-
-        reply = QMessageBox.question(
-            self, "Tunnel service",
-            "Installeer de tunnel service?\n\n"
-            "De service start/stopt automatisch met de app.\n"
-            "macOS vraagt éénmalig je admin wachtwoord.\n"
-            "Daarna nooit meer prompts.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if reply != QMessageBox.StandardButton.Yes:
-            self._status_label.setText("Geen tunnel")
-            return
-
-        self._status_label.setText("Tunnel installeren…")
-        ok, err = tunnel_manager.install_service()
-        if not ok:
-            QMessageBox.warning(self, "Installatie mislukt", err)
-            self._status_label.setText("Geen tunnel")
-            return
-
-        ok, err = tunnel_manager.start_service()
-        if ok:
-            self._started_tunnel = True
-            self._status_label.setText("Tunnel actief")
-            self.device_manager.start_discovery()
-        else:
-            QMessageBox.warning(self, "Tunnel start mislukt", err)
-            self._status_label.setText("Tunnel geïnstalleerd, niet gestart")
+    async def async_close(self) -> None:
+        """Async teardown called from the signal handler / close event."""
+        settings = QSettings("iPhoneMirroring", "iPhoneMirror")
+        settings.setValue("window/pos", self.pos())
+        self._stop_capture()
+        self.input_handler.cleanup()
+        task = getattr(self, "_devices_refresh_task", None)
+        if task is not None and not task.done():
+            task.cancel()
+        try:
+            await self.device_manager.cleanup()
+        except Exception as e:
+            logger.warning("device_manager.cleanup: %s", e)
 
     def _setup_ui(self):
         central = QWidget()
@@ -799,15 +705,15 @@ class MainWindow(QMainWindow):
         self._status_label.setText(f"Error: {msg[:50]}")
 
     def _start_wda_auto(self):
-        def _setup():
-            token = wda_auth.get_or_create_token()
-            self.input_handler.wda.set_auth_token(token)
-            wda_url = self.device_manager.get_wda_url()
-            self.input_handler.wda.base_url = wda_url.rstrip("/")
-            logger.info("WDA URL: %s", wda_url)
-            self.device_manager.start_wda(auth_token=token)
-
-        threading.Thread(target=_setup, daemon=True).start()
+        token = wda_auth.get_or_create_token()
+        self.input_handler.wda.set_auth_token(token)
+        wda_url = self.device_manager.get_wda_url()
+        self.input_handler.wda.base_url = wda_url.rstrip("/")
+        logger.info("WDA URL: %s", wda_url)
+        # start_wda is a subprocess spawn (blocking ~5s while it waits for
+        # xcuitest to come up). Run it in an executor to keep the UI responsive.
+        loop = asyncio.get_event_loop()
+        loop.run_in_executor(None, self.device_manager.start_wda, token)
         self._wda_retry_timer.start()
 
     def _try_wda(self):
@@ -865,16 +771,19 @@ class MainWindow(QMainWindow):
 
     def _on_reconnect(self):
         self._on_device_disconnected()
-        self.device_manager.disconnect()
+        asyncio.ensure_future(self._async_reconnect())
+
+    async def _async_reconnect(self) -> None:
+        await self.device_manager.disconnect()
         self.device_manager.start_discovery()
 
     def closeEvent(self, event):
-        settings = QSettings("iPhoneMirroring", "iPhoneMirror")
-        settings.setValue("window/pos", self.pos())
-        self._stop_capture()
-        self.input_handler.cleanup()
-        self.device_manager.cleanup()
-        if getattr(self, "_started_tunnel", False):
-            logger.info("Stopping tunnel service (started by app)")
-            tunnel_manager.stop_service()
+        # main.py's signal handler will call async_close via the event loop.
+        # For a normal close-button click, kick off the same async teardown.
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.ensure_future(self.async_close())
+        except RuntimeError:
+            pass
         super().closeEvent(event)

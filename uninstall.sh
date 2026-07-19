@@ -1,6 +1,6 @@
 #!/bin/bash
-# iPhone Mirror — uninstaller
-# Removes tunnel service, sudoers rule, and venv.
+# iPhone Mirror — uninstaller (v9)
+# Verwijdert venv + eventuele v7-legacy tunnel service.
 
 set -e
 
@@ -18,24 +18,20 @@ warn() { echo -e "${YELLOW}!${NC} $1"; }
 
 info "iPhone Mirror uninstaller"
 
-DAEMON_PLIST="/Library/LaunchDaemons/com.sabsteef.iphonemirror.tunneld.plist"
-SUDOERS_FILE="/etc/sudoers.d/iphonemirror"
-LOG_FILE="/var/log/iphonemirror-tunneld.log"
+# v7 legacy — als hij er is, ruim hem op
+LEGACY_PLIST="/Library/LaunchDaemons/com.sabsteef.iphonemirror.tunneld.plist"
+LEGACY_SUDOERS="/etc/sudoers.d/iphonemirror"
+LEGACY_LOG="/var/log/iphonemirror-tunneld.log"
 
-NEEDS_ROOT=false
-[[ -f "$DAEMON_PLIST" ]] && NEEDS_ROOT=true
-[[ -f "$SUDOERS_FILE" ]] && NEEDS_ROOT=true
-[[ -f "$LOG_FILE" ]] && NEEDS_ROOT=true
-
-if $NEEDS_ROOT; then
-    info "Tunnel service verwijderen (vraagt admin wachtwoord)"
+if [[ -f "$LEGACY_PLIST" ]] || [[ -f "$LEGACY_SUDOERS" ]] || [[ -f "$LEGACY_LOG" ]]; then
+    info "v7 tunnel service opruimen (vraagt admin wachtwoord)"
     sudo bash -c "
-        /bin/launchctl unload '$DAEMON_PLIST' 2>/dev/null || true
-        rm -f '$DAEMON_PLIST' '$SUDOERS_FILE' '$LOG_FILE'
+        /bin/launchctl unload '$LEGACY_PLIST' 2>/dev/null || true
+        rm -f '$LEGACY_PLIST' '$LEGACY_SUDOERS' '$LEGACY_LOG'
     "
-    ok "Service verwijderd"
+    ok "v7 service verwijderd"
 else
-    ok "Service was niet geïnstalleerd"
+    ok "Geen v7 service om op te ruimen"
 fi
 
 if [[ -d "$SCRIPT_DIR/.venv" ]]; then
@@ -46,9 +42,6 @@ if [[ -d "$SCRIPT_DIR/.venv" ]]; then
         ok "Venv verwijderd"
     fi
 fi
-
-warn "pymobiledevice3 blijft geïnstalleerd in system Python"
-warn "Verwijder handmatig: /opt/homebrew/bin/python3 -m pip uninstall pymobiledevice3"
 
 echo
 ok "Uninstall voltooid"

@@ -1,9 +1,38 @@
+"""Screen capture pipeline (v9-compatible).
+
+Design: capture happens in a *subprocess*, not in a Qt thread.
+
+Rationale (unchanged from v7): pymobiledevice3 DVT calls (and MJPEG socket
+reads under load) hold the GIL for hundreds of ms at a time. In-process that
+starves the Qt UI, leading to stuttering, dropped frames on click, and janky
+scroll. A separate Python process solves this by design — the GIL contention
+is gone and IPC over a length-prefixed stdout pipe is cheap.
+
+Three modes, tried in order:
+    1. **MJPEG subprocess** (preferred) — talks to WDA's MJPEG server on port
+       9100 via the developer tunnel. ~10-15 FPS with tunable quality/scale.
+       We just need the tunnel IPv6 host — the worker knows nothing about
+       pymobiledevice3.
+    2. **DVT subprocess** — DVT ``Screenshot`` service. ~2 FPS but works
+       without WDA (fallback when MJPEG can't connect).
+    3. **DVT inline** — final fallback, DVT called in-process. Only used when
+       subprocess spawn itself fails.
+
+The DVT worker is not yet ported to v9. The MJPEG worker doesn't need
+pymobiledevice3 at all, so it works unchanged.
+"""
+
+from __future__ import annotations
+
 import logging
+import os
 import re
+import signal
 import struct
 import subprocess
 import sys
 import time
+from typing import Optional
 
 from PyQt6.QtCore import QThread, pyqtSignal
 from PyQt6.QtGui import QImage
@@ -17,7 +46,6 @@ class ScreenCaptureThread(QThread):
     capture_error = pyqtSignal(str)
 
     MJPEG_PORT = 9100
-    WORKER_READY_TIMEOUT = 30
 
     def __init__(self, device_manager, target_fps: int = 30):
         super().__init__()
@@ -25,16 +53,25 @@ class ScreenCaptureThread(QThread):
         self._running = False
         self._target_fps = target_fps
         self._paused = False
-        self._worker: subprocess.Popen | None = None
+        self._worker: Optional[subprocess.Popen] = None
         self._mode = "mjpeg"
 
-    def pause(self):
+    # ─────────────────────────── public controls ─────────────────────────────
+
+    def pause(self) -> None:
         self._paused = True
 
-    def resume(self):
+    def resume(self) -> None:
         self._paused = False
 
-    def run(self):
+    def stop(self) -> None:
+        self._running = False
+        self._stop_worker()
+        self.wait(5000)
+
+    # ─────────────────────────── QThread entry ───────────────────────────────
+
+    def run(self) -> None:
         self._running = True
         logger.info("Screen capture started")
 
@@ -42,14 +79,16 @@ class ScreenCaptureThread(QThread):
         host = self._extract_host()
         if host and self._run_mjpeg(host, self.MJPEG_PORT):
             pass
-        elif udid and udid != "tunnel" and self._run_dvt_subprocess(udid):
+        elif udid and self._run_dvt_subprocess(udid):
             pass
         else:
             self._run_dvt_inline()
 
         logger.info("Screen capture stopped")
 
-    def _extract_host(self) -> str | None:
+    # ─────────────────────────── helpers ─────────────────────────────────────
+
+    def _extract_host(self) -> Optional[str]:
         url = self._device_manager.get_wda_url()
         m = re.match(r"http://\[([^\]]+)\]:", url)
         if m:
@@ -59,7 +98,7 @@ class ScreenCaptureThread(QThread):
             return m.group(1)
         return None
 
-    def _start_worker(self, module: str, *args) -> subprocess.Popen | None:
+    def _start_worker(self, module: str, *args: str) -> Optional[subprocess.Popen]:
         cmd = [sys.executable, "-m", module, *args]
         try:
             proc = subprocess.Popen(
@@ -92,7 +131,7 @@ class ScreenCaptureThread(QThread):
             logger.warning("Failed to start %s: %s", module, e)
             return None
 
-    def _read_frame(self, proc: subprocess.Popen) -> bytes | None:
+    def _read_frame(self, proc: subprocess.Popen) -> Optional[bytes]:
         header = b""
         while len(header) < 4:
             chunk = proc.stdout.read(4 - len(header))
@@ -122,10 +161,8 @@ class ScreenCaptureThread(QThread):
             if self._paused:
                 time.sleep(0.1)
                 continue
-
             if self._worker.poll() is not None:
                 return False
-
             data = self._read_frame(self._worker)
             if data is None:
                 return False
@@ -138,16 +175,17 @@ class ScreenCaptureThread(QThread):
             frame_count += 1
             elapsed = time.time() - fps_timer
             if elapsed >= 1.0:
-                instant_fps = frame_count / elapsed
-                if smoothed_fps == 0:
-                    smoothed_fps = instant_fps
-                else:
-                    smoothed_fps = alpha * instant_fps + (1 - alpha) * smoothed_fps
+                instant = frame_count / elapsed
+                smoothed_fps = instant if smoothed_fps == 0 else (
+                    alpha * instant + (1 - alpha) * smoothed_fps
+                )
                 self.fps_updated.emit(smoothed_fps)
                 frame_count = 0
                 fps_timer = time.time()
 
         return True
+
+    # ─────────────────────────── modes ───────────────────────────────────────
 
     def _run_mjpeg(self, host: str, port: int) -> bool:
         for attempt in range(3):
@@ -157,9 +195,9 @@ class ScreenCaptureThread(QThread):
             if self._worker:
                 self._mode = "mjpeg"
                 logger.info("Using MJPEG capture (host=%s port=%d)", host, port)
-                clean_exit = self._stream_from_worker()
+                clean = self._stream_from_worker()
                 self._stop_worker()
-                if not self._running or clean_exit:
+                if not self._running or clean:
                     return True
                 logger.warning("MJPEG worker died, restarting...")
                 continue
@@ -184,53 +222,20 @@ class ScreenCaptureThread(QThread):
                 return False
         return True
 
-    def _run_dvt_inline(self):
+    def _run_dvt_inline(self) -> None:
         self._mode = "dvt-inline"
-        logger.info("Using DVT inline capture (final fallback)")
-        frame_count = 0
-        fps_timer = time.time()
-        consecutive_errors = 0
+        logger.info("Using DVT inline capture (final fallback — expect stutter)")
+        logger.warning(
+            "Inline DVT is not implemented in v9 yet — capture disabled."
+        )
+        self.capture_error.emit(
+            "Screen capture unavailable: MJPEG failed and DVT inline not supported in v9."
+        )
+        self._running = False
 
-        while self._running:
-            if self._paused:
-                time.sleep(0.1)
-                continue
-
-            try:
-                screenshot_bytes = self._device_manager.take_screenshot()
-                qimage = QImage()
-                if not qimage.loadFromData(screenshot_bytes):
-                    continue
-                self.frame_ready.emit(qimage)
-
-                frame_count += 1
-                elapsed = time.time() - fps_timer
-                if elapsed >= 2.0:
-                    self.fps_updated.emit(frame_count / elapsed)
-                    frame_count = 0
-                    fps_timer = time.time()
-
-                consecutive_errors = 0
-
-            except ConnectionError as e:
-                logger.error("Connection error in capture: %s", e)
-                self.capture_error.emit(str(e))
-                self._running = False
-                break
-
-            except Exception as e:
-                consecutive_errors += 1
-                if consecutive_errors >= 10:
-                    self.capture_error.emit(f"Too many errors: {e}")
-                    self._running = False
-                    break
-                time.sleep(0.5)
-
-    def _stop_worker(self):
+    def _stop_worker(self) -> None:
         if not self._worker:
             return
-        import os
-        import signal
         proc = self._worker
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
@@ -247,8 +252,3 @@ class ScreenCaptureThread(QThread):
             except Exception:
                 pass
         self._worker = None
-
-    def stop(self):
-        self._running = False
-        self._stop_worker()
-        self.wait(5000)

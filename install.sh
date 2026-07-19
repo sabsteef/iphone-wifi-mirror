@@ -1,6 +1,6 @@
 #!/bin/bash
-# iPhone Mirror — installer
-# Installs prerequisites, creates venv, installs deps.
+# iPhone Mirror — installer (v9)
+# Zero sudo. Zero LaunchDaemon. pymobiledevice3 v9 draait de tunnel in-process.
 
 set -e
 
@@ -18,9 +18,7 @@ ok()    { echo -e "${GREEN}✓${NC} $1"; }
 warn()  { echo -e "${YELLOW}!${NC} $1"; }
 error() { echo -e "${RED}✗${NC} $1"; exit 1; }
 
-# ─── Preflight ───────────────────────────────────────────────────────────────
-
-info "iPhone Mirror installer"
+info "iPhone Mirror installer (v9, no sudo)"
 
 if [[ "$(uname)" != "Darwin" ]]; then
     error "Alleen macOS wordt ondersteund"
@@ -54,7 +52,7 @@ else
     ok "Python 3 aanwezig ($($PYTHON_BIN --version))"
 fi
 
-# ─── Xcode command-line tools (voor WDA build later) ─────────────────────────
+# ─── Xcode Command Line Tools ────────────────────────────────────────────────
 
 if ! xcode-select -p &> /dev/null; then
     warn "Xcode Command Line Tools niet gevonden"
@@ -89,8 +87,6 @@ EOF
 chmod +x "$SCRIPT_DIR/run.sh"
 ok "Run script aangemaakt: run.sh"
 
-# ─── Klaar ───────────────────────────────────────────────────────────────────
-
 echo
 echo -e "${GREEN}══════════════════════════════════════════${NC}"
 ok "Installatie voltooid"
@@ -109,7 +105,6 @@ echo
 echo "  3) App starten:"
 echo "     ${BLUE}./run.sh${NC}"
 echo
-echo "  Bij eerste start vraagt de app om de tunnel service te installeren."
-echo "  Klik 'Yes' en voer éénmalig je Mac wachtwoord in."
-echo "  Daarna start/stopt de tunnel automatisch met de app."
+echo "  De tunnel wordt volledig in-process opgezet — geen sudo prompts,"
+echo "  geen LaunchDaemon, geen macOS admin toegang nodig."
 echo
