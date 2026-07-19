@@ -827,24 +827,28 @@ class MainWindow(QMainWindow):
         pass
 
     def _update_battery(self):
-        try:
-            if self.input_handler.wda.is_connected:
-                info = self.input_handler.wda.get_battery_info()
-                if info and info.get("level", -1) >= 0:
-                    level = info["level"]
-                    state = info.get("state", 0)
-                    charging = " +" if state == 2 else ""
-                    self._battery_label.setText(f"🔋 {level}%{charging}")
-                    return
+        if not self.input_handler.wda.is_connected:
+            return
+        # Run the sync HTTP call in a thread so slow WDA doesn't lock the UI.
+        loop = asyncio.get_event_loop()
+        future = loop.run_in_executor(None, self.input_handler.wda.get_battery_info)
+        future.add_done_callback(self._on_battery_info)
 
-            if self.device_manager.is_connected:
-                info = self.device_manager.get_battery_info()
-                level = info.get("level", -1)
-                if level >= 0:
-                    charging = " +" if info.get("charging", False) else ""
-                    self._battery_label.setText(f"🔋 {level}%{charging}")
+    def _on_battery_info(self, future) -> None:
+        try:
+            info = future.result()
         except Exception as e:
-            logger.debug("Battery update failed: %s", e)
+            logger.debug("Battery poll failed: %s", e)
+            return
+        if not info or info.get("level", -1) < 0:
+            return
+        level = info["level"]
+        state = info.get("state", 0)
+        charging = " +" if state == 2 else ""
+        # Signal-safe: setText from any thread works because we're on the
+        # qasync loop thread when the callback fires (executor completion is
+        # scheduled on the loop).
+        self._battery_label.setText(f"🔋 {level}%{charging}")
 
     def _on_home(self):
         self.input_handler.go_home()

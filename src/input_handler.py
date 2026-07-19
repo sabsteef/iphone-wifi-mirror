@@ -44,14 +44,14 @@ class WDAClient:
 
     def connect(self) -> bool:
         try:
-            resp = self._session.get(f"{self.base_url}/status", timeout=3)
+            resp = self._session.get(f"{self.base_url}/status", timeout=2)
             if resp.status_code != 200:
                 return False
 
             resp = self._session.post(
                 f"{self.base_url}/session",
                 json={"capabilities": {}},
-                timeout=10,
+                timeout=5,
             )
             data = resp.json()
             self.session_id = data.get("sessionId")
@@ -102,7 +102,7 @@ class WDAClient:
                 pass
             self.session_id = None
 
-    def _post(self, path: str, json_data: dict, timeout: float = 10):
+    def _post(self, path: str, json_data: dict, timeout: float = 5):
         with self._lock:
             for attempt in range(2):
                 if not self.session_id:
@@ -145,7 +145,7 @@ class WDAClient:
             resp = self._session.post(
                 f"{self.base_url}/session",
                 json={"capabilities": {}},
-                timeout=10,
+                timeout=5,
             )
             if resp.status_code != 200:
                 return False
