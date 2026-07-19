@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+.venv/
+venv/
+env/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+*.spec
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# App-generated
+run.sh
+/tmp/
+*.log
+
+# WebDriverAgent
+WebDriverAgent/build/
+WebDriverAgent/DerivedData/
+WebDriverAgent/*.xcodeproj/xcuserdata/
+WebDriverAgent/*.xcworkspace/xcuserdata/
+
+# Local overrides
+.env
+.env.local
