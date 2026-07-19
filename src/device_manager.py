@@ -29,6 +29,7 @@ from typing import Optional
 
 from PyQt6.QtCore import QObject, pyqtSignal
 
+from pymobiledevice3.bonjour import browse_mobdev2
 from pymobiledevice3.remote.remote_service_discovery import RemoteServiceDiscoveryService
 from pymobiledevice3.usbmux import list_devices as usbmux_list_devices
 
@@ -93,7 +94,18 @@ class DeviceManager(QObject):
         return self._tunnel_mgr.rsd
 
     def set_preferred_udid(self, udid: Optional[str]) -> None:
+        prev = self._preferred_udid
         self._preferred_udid = udid or None
+        if prev == self._preferred_udid:
+            return
+        # If we're currently connected to a different device, drop it so the
+        # discovery loop picks the new preference next tick.
+        if self._current_udid and self._current_udid != self._preferred_udid:
+            logger.info(
+                "Preferred device changed (%s -> %s), disconnecting to switch",
+                prev, self._preferred_udid,
+            )
+            asyncio.ensure_future(self.disconnect())
 
     def get_wda_url(self) -> str:
         rsd = self._tunnel_mgr.rsd
@@ -165,6 +177,26 @@ class DeviceManager(QObject):
                 pass
             result.append(info)
         return result
+
+    async def bonjour_visible_hosts(self, timeout: float = 2.5) -> list[str]:
+        """Return iPhone-like hostnames Bonjour advertises on the local network.
+
+        Used as a supplementary signal when usbmux sees zero devices:
+        Bonjour can pick up iPhones that usbmux hasn't paired with yet,
+        letting the UI hint at "iPhone in range but trust missing" instead
+        of an empty search screen.
+        """
+        try:
+            answers = await browse_mobdev2(timeout=timeout)
+        except Exception as e:
+            logger.debug("Bonjour browse failed: %s", e)
+            return []
+        seen = []
+        for a in answers:
+            host = getattr(a, "host", "") or ""
+            if host and host not in seen:
+                seen.append(host)
+        return seen
 
     def _pick_best(self, devices: list[dict]) -> Optional[dict]:
         if not devices:

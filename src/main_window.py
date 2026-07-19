@@ -435,27 +435,46 @@ class MainWindow(QMainWindow):
                     self.device_manager._last_devices = devices
                     # If not connected yet, keep the placeholder informative.
                     if not self._connected:
-                        self._update_search_placeholder(devices)
+                        bonjour_hosts = []
+                        if not devices:
+                            # Fall back to bonjour to detect iPhones out of
+                            # usbmux reach (trust popup not accepted etc.).
+                            bonjour_hosts = await self.device_manager.bonjour_visible_hosts()
+                        self._update_search_placeholder(devices, bonjour_hosts)
                 except Exception as e:
                     logger.debug("Device refresh failed: %s", e)
                 await asyncio.sleep(3.0)
         except asyncio.CancelledError:
             pass
 
-    def _update_search_placeholder(self, devices: list[dict]) -> None:
+    def _update_search_placeholder(
+        self, devices: list[dict], bonjour_hosts: list[str] | None = None,
+    ) -> None:
         preferred = QSettings("iPhoneMirroring", "iPhoneMirror").value(
             "device/preferred_udid", "", type=str
         )
         if not devices:
-            self.screen_view.set_placeholder(
-                "Zoeken naar iPhone…\n\n"
-                "Geen device gevonden.\n\n"
-                "Als hij niet verschijnt:\n"
-                "• Zelfde WiFi als je Mac\n"
-                "• Developer Mode aan\n"
-                "• Kabel er even in (Trust popup)"
-            )
-            self._status_label.setText("Geen iPhone gevonden")
+            if bonjour_hosts:
+                host_list = "\n".join(f"  • {h}" for h in bonjour_hosts[:3])
+                self.screen_view.set_placeholder(
+                    "iPhone in bereik maar niet gepaird\n\n"
+                    f"Bonjour ziet:\n{host_list}\n\n"
+                    "Fix: kabel er even in, accepteer\n"
+                    "'Vertrouw deze computer' popup."
+                )
+                self._status_label.setText(
+                    f"{len(bonjour_hosts)} iPhone(s) zichtbaar, niet gepaird"
+                )
+            else:
+                self.screen_view.set_placeholder(
+                    "Zoeken naar iPhone…\n\n"
+                    "Geen device gevonden.\n\n"
+                    "Als hij niet verschijnt:\n"
+                    "• Zelfde WiFi als je Mac\n"
+                    "• Developer Mode aan\n"
+                    "• Kabel er even in (Trust popup)"
+                )
+                self._status_label.setText("Geen iPhone gevonden")
             return
         if preferred and not any(d["udid"] == preferred for d in devices):
             names = ", ".join(d.get("name", "iPhone") for d in devices)
@@ -732,6 +751,13 @@ class MainWindow(QMainWindow):
         self._wda_banner.setVisible(False)
 
         self.screen_view.show_disconnected()
+
+        # Restart discovery so a device switch (via Settings) or a fresh
+        # boot of the iPhone is picked up automatically.
+        try:
+            self.device_manager.start_discovery()
+        except Exception as e:
+            logger.debug("Discovery restart after disconnect failed: %s", e)
 
     def _on_connection_error(self, msg: str):
         self._status_label.setText("Error")
