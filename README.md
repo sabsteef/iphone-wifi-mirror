@@ -162,15 +162,21 @@ You only need to do this once per Apple ID per iPhone.
 
 ### Part 4 — Point the app at your bundle ID
 
-The mirror app needs to know which bundle ID you chose in Part 3:
+The mirror app needs to know which bundle ID you chose in Part 3. Set it **once** in the config file so both `./run.sh` (Terminal) and the `/Applications/iPhone Mirror.app` (Finder) can find it — a Finder-launched app doesn't inherit your shell environment.
 
-```bash
-export WDA_BUNDLE_ID="com.jdoe.WebDriverAgentRunner.xctrunner"
+Create `~/.config/iphone-mirror/config.json`:
+
+```json
+{
+  "wda_bundle_id": "com.jdoe.WebDriverAgentRunner.xctrunner",
+  "tap_y_scale": 0.95,
+  "tap_x_scale": 1.0
+}
 ```
 
 Note the **`.xctrunner`** suffix — that's what Xcode adds to the WebDriverAgentRunner build. If you used `com.jdoe.WebDriverAgentRunner` as bundle ID in Xcode, the runtime bundle is `com.jdoe.WebDriverAgentRunner.xctrunner`.
 
-Add the export to your `~/.zshrc` (or shell rc file) so you don't have to do it every session.
+If the file doesn't exist yet, the first launch creates a template you can edit. The `WDA_BUNDLE_ID` environment variable still wins if set (handy for quick tests from a shell).
 
 ### Part 5 — Launch
 
@@ -252,6 +258,10 @@ Older versions had a Unicode-Private-Use-Area bug where WebDriver key codes (`�
 ### Drawing lines are offset from the mouse
 
 Recent WDA builds route drags through `wda/dragfromtoforduration`, which has a linear y-drift on iPhone 17. This project routes drags through the W3C `/actions` endpoint instead — same coord semantics as `/wda/tap`, so lines land where you drag.
+
+### Where are the logs?
+
+Every launch appends to `~/Library/Logs/iPhoneMirror.log` (rotated at ~5 MB). If something goes wrong, `tail -f ~/Library/Logs/iPhoneMirror.log` is where to look.
 
 ### Low FPS
 

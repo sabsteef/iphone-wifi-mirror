@@ -57,12 +57,12 @@ class ScreenView(QWidget):
         self._pixmap: QPixmap | None = None
         self._has_frame = False
         self._placeholder_text = (
-            "Zoeken naar iPhone…\n\n"
-            "Als hij niet gevonden wordt:\n"
-            "• Zelfde WiFi als je Mac\n"
-            "• Developer Mode aan\n"
-            "• Gepaird via USB (eenmalig)\n"
-            "• iPhone even ontgrendelen"
+            "Looking for iPhone…\n\n"
+            "If it doesn't show up:\n"
+            "• Same WiFi as your Mac\n"
+            "• Developer Mode enabled\n"
+            "• Paired over USB (once)\n"
+            "• Unlock the iPhone briefly"
         )
 
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -269,7 +269,7 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self._udid = udid
         self._device_manager = device_manager
-        self.setWindowTitle("Instellingen")
+        self.setWindowTitle("Settings")
         self.setModal(True)
         self.setMinimumWidth(460)
 
@@ -291,18 +291,18 @@ class SettingsDialog(QDialog):
         )
         layout = QVBoxLayout(group)
 
-        title = QLabel("iPhone kiezen")
+        title = QLabel("Pick iPhone")
         title.setStyleSheet("font-weight: bold; font-size: 13px;")
         layout.addWidget(title)
 
         info = QLabel(
-            "Kies welke iPhone gemirrord wordt. Wijziging vereist reconnect."
+            "Choose which iPhone to mirror. Changing requires a reconnect."
         )
         info.setStyleSheet("color: #888; font-size: 11px;")
         layout.addWidget(info)
 
         self._device_combo = QComboBox()
-        self._device_combo.addItem("Automatisch (eerste beschikbare)", "")
+        self._device_combo.addItem("Automatic (first available)", "")
 
         settings = QSettings("iPhoneMirroring", "iPhoneMirror")
         preferred = settings.value("device/preferred_udid", "", type=str)
@@ -353,7 +353,7 @@ class SettingsDialog(QDialog):
         layout.addWidget(title)
 
         info = QLabel(
-            "Opgeslagen in macOS Keychain per device.\n"
+            "Stored in the macOS Keychain per device.\n"
             "Wordt gebruikt door Unlock (🔓)."
         )
         info.setStyleSheet("color: #888; font-size: 11px;")
@@ -373,7 +373,7 @@ class SettingsDialog(QDialog):
         layout.addLayout(row)
 
         if not self._udid:
-            info.setText("Geen device verbonden — passcode niet opslaanbaar")
+            info.setText("No device connected — passcode cannot be saved")
             self._pc_input.setEnabled(False)
             save_btn.setEnabled(False)
 
@@ -382,12 +382,12 @@ class SettingsDialog(QDialog):
     def _save_passcode(self):
         code = self._pc_input.text().strip()
         if code and not code.isdigit():
-            QMessageBox.warning(self, "Ongeldig", "Passcode moet alleen cijfers bevatten.")
+            QMessageBox.warning(self, "Invalid", "Passcode must contain digits only.")
             return
         if passcode_store.set_passcode(self._udid, code):
-            QMessageBox.information(self, "Opgeslagen", "Passcode opgeslagen in Keychain.")
+            QMessageBox.information(self, "Saved", "Passcode saved to the Keychain.")
         else:
-            QMessageBox.warning(self, "Fout", "Kon passcode niet opslaan.")
+            QMessageBox.warning(self, "Error", "Could not save passcode.")
 
 
 class MainWindow(QMainWindow):
@@ -438,7 +438,7 @@ class MainWindow(QMainWindow):
 
     async def start_async(self) -> None:
         """Called after the qasync loop is running. Starts device discovery."""
-        self._status_label.setText("Zoeken naar iPhone…")
+        self._status_label.setText("Looking for iPhone…")
         # DeviceManager owns the userspace tunnel — no external service needed.
         self.device_manager.start_discovery()
         # Poll available devices for the settings picker every few seconds.
@@ -474,37 +474,37 @@ class MainWindow(QMainWindow):
             if bonjour_hosts:
                 host_list = "\n".join(f"  • {h}" for h in bonjour_hosts[:3])
                 self.screen_view.set_placeholder(
-                    "iPhone in bereik maar niet gepaird\n\n"
-                    f"Bonjour ziet:\n{host_list}\n\n"
-                    "Fix: kabel er even in, accepteer\n"
-                    "'Vertrouw deze computer' popup."
+                    "iPhone in range but not paired\n\n"
+                    f"Bonjour sees:\n{host_list}\n\n"
+                    "Fix: briefly plug in USB and accept\n"
+                    "the 'Trust this computer' prompt."
                 )
                 self._status_label.setText(
-                    f"{len(bonjour_hosts)} iPhone(s) zichtbaar, niet gepaird"
+                    f"{len(bonjour_hosts)} iPhone(s) visible, not paired"
                 )
             else:
                 self.screen_view.set_placeholder(
-                    "Zoeken naar iPhone…\n\n"
-                    "Geen device gevonden.\n\n"
-                    "Als hij niet verschijnt:\n"
-                    "• Zelfde WiFi als je Mac\n"
-                    "• Developer Mode aan\n"
-                    "• Kabel er even in (Trust popup)"
+                    "Looking for iPhone…\n\n"
+                    "No device found.\n\n"
+                    "If it doesn't appear:\n"
+                    "• Same WiFi as your Mac\n"
+                    "• Developer Mode enabled\n"
+                    "• Plug in the USB cable (Trust popup)"
                 )
-                self._status_label.setText("Geen iPhone gevonden")
+                self._status_label.setText("No iPhone found")
             return
         if preferred and not any(d["udid"] == preferred for d in devices):
             names = ", ".join(d.get("name", "iPhone") for d in devices)
             self.screen_view.set_placeholder(
-                "Voorkeurs-iPhone offline\n\n"
-                f"Gevonden: {names}\n"
-                "Kies ⚙ → iPhone kiezen"
+                "Preferred iPhone offline\n\n"
+                f"Found: {names}\n"
+                "Kies ⚙ → Pick iPhone"
             )
             self._status_label.setText(f"{len(devices)} device(s), voorkeur offline")
             return
         # We have a matching device — tunnel is still opening.
-        self.screen_view.set_placeholder("Tunnel opzetten…")
-        self._status_label.setText("Tunnel opzetten…")
+        self.screen_view.set_placeholder("Opening tunnel…")
+        self._status_label.setText("Opening tunnel…")
 
     async def async_close(self) -> None:
         """Async teardown called from the signal handler / close event.
@@ -693,7 +693,7 @@ class MainWindow(QMainWindow):
             ("＋", "Volume up", None, lambda: self.input_handler.press_button("volumeUp")),
             ("−", "Volume down", None, lambda: self.input_handler.press_button("volumeDown")),
             ("↻", "Reconnect", None, self._on_reconnect),
-            ("⚙", "Passcode configureren", None, self._on_configure_passcode),
+            ("⚙", "Configure passcode", None, self._on_configure_passcode),
         ]
         for label, tip, shortcut, handler in specs:
             btn = DockButton(label, tip)
@@ -740,29 +740,29 @@ class MainWindow(QMainWindow):
 
     def _on_tunnel_status(self, status: str, reason: str) -> None:
         if status == "lost":
-            self._status_label.setText(f"Tunnel weg — reconnect… ({reason[:30]})")
+            self._status_label.setText(f"Tunnel lost — reconnecting… ({reason[:30]})")
             self.screen_view.set_placeholder(
-                "Verbinding verloren\n\n"
-                "Automatisch aan het reconnecten…\n\n"
-                f"Reden: {reason[:60]}"
+                "Connection lost\n\n"
+                "Reconnecting automatically…\n\n"
+                f"Reason: {reason[:60]}"
             )
             self.screen_view.show_disconnected()
             self._stop_capture()
             self._wda_retry_timer.stop()
             self._keepalive_timer.stop()
         elif status == "reconnecting":
-            self._status_label.setText(f"Reconnect… ({reason[:40]})")
-            self.screen_view.set_placeholder(f"Reconnecten…\n\n{reason}")
+            self._status_label.setText(f"Reconnecting… ({reason[:40]})")
+            self.screen_view.set_placeholder(f"Reconnecting…\n\n{reason}")
         elif status == "reconnected":
-            self._status_label.setText("Reconnected — capture herstart")
+            self._status_label.setText("Reconnected — capture restarted")
             self._start_capture()
             self._start_wda_auto()
         elif status == "failed":
-            self._status_label.setText("Reconnect mislukt — check iPhone/WiFi")
+            self._status_label.setText("Reconnect failed — check iPhone/WiFi")
             self.screen_view.set_placeholder(
                 "Reconnect mislukt\n\n"
                 "Klik ↻ voor handmatige retry, of\n"
-                "steek de kabel er even in."
+                "briefly plug in the USB cable."
             )
 
     def _on_device_connected(self, info: dict):
@@ -894,7 +894,7 @@ class MainWindow(QMainWindow):
                 self._wda_retry_attempt - 1,
             )
             self._wda_retry_timer.stop()
-            self._status_label.setText("WDA niet bereikbaar — check iPhone")
+            self._status_label.setText("WDA unreachable — check iPhone")
             return
         token = wda_auth.get_or_create_token()
         self.input_handler.wda.set_auth_token(token)

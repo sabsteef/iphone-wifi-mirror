@@ -21,11 +21,39 @@ from src.main_window import MainWindow
 
 
 def setup_logging() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
+    """Log to stderr AND to ~/Library/Logs/iPhoneMirror.log.
+
+    An .app launched from Finder has no stderr the user can see. The
+    file sink means a support user (or the developer) can always find
+    out what happened. Rotates on ~5 MB.
+    """
+    from logging.handlers import RotatingFileHandler
+    from pathlib import Path
+
+    log_dir = Path.home() / "Library" / "Logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / "iPhoneMirror.log"
+
+    fmt = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    # Clear anything set by basicConfig on earlier import chains.
+    root.handlers.clear()
+
+    stream = logging.StreamHandler()
+    stream.setFormatter(fmt)
+    root.addHandler(stream)
+
+    file_handler = RotatingFileHandler(
+        log_path, maxBytes=5 * 1024 * 1024, backupCount=2, encoding="utf-8",
+    )
+    file_handler.setFormatter(fmt)
+    root.addHandler(file_handler)
+
+    root.info("Log file: %s", log_path)
 
 
 def check_dependencies() -> None:

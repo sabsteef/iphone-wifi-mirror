@@ -12,11 +12,12 @@ logger = logging.getLogger(__name__)
 
 # Empirical compensation for the WDA tap y-space overshoot on iPhone 17
 # Pro Max + iOS 27: horizontal lines land progressively BELOW the mouse
-# cursor as y grows (user report). A linear shrink of the y-coordinate
-# fixes it because the drift is proportional to frac_y. Override at
-# runtime with the TAP_Y_SCALE env var if the default value is off.
-TAP_Y_SCALE = float(os.environ.get("TAP_Y_SCALE", "0.95"))
-TAP_X_SCALE = float(os.environ.get("TAP_X_SCALE", "1.0"))
+# cursor as y grows. A linear shrink fixes it because the drift is
+# proportional to frac_y. Overridable via config or env var; see
+# src/user_config.py.
+from src.user_config import get_tap_x_scale, get_tap_y_scale
+TAP_Y_SCALE = get_tap_y_scale()
+TAP_X_SCALE = get_tap_x_scale()
 
 
 class GestureState(Enum):

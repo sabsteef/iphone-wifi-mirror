@@ -79,14 +79,12 @@ class DeviceManager(QObject):
     tunnel_status_changed = pyqtSignal(str, str)  # (status, reason)
 
     # Bundle ID of the signed WebDriverAgentRunner app on the iPhone.
-    # Every user must sign their own build with their Apple Developer
-    # account, so this MUST be overridable per install. Set the
-    # WDA_BUNDLE_ID env var to the value you used when building WDA.
-    # See README.md → "Build & install WebDriverAgent".
-    WDA_BUNDLE_ID = os.environ.get(
-        "WDA_BUNDLE_ID",
-        "com.example.WebDriverAgentRunner.xctrunner",
-    )
+    # Read from ~/.config/iphone-mirror/config.json OR the WDA_BUNDLE_ID
+    # env var. The env var wins for Terminal launches; the config file
+    # is what Finder-launched .app bundles use (they don't inherit the
+    # shell environment). See README.md → "Build & install WebDriverAgent".
+    from src.user_config import get_wda_bundle_id as _get_wda_bundle_id
+    WDA_BUNDLE_ID = _get_wda_bundle_id()
     DISCOVERY_INTERVAL_S = 2.0
 
     def __init__(self, parent: Optional[QObject] = None):
