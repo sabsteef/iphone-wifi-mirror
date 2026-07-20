@@ -284,6 +284,7 @@ class DeviceManager(QObject):
             sys.executable, "-m", "pymobiledevice3",
             "developer", "dvt", "xcuitest",
             self.WDA_BUNDLE_ID,
+            "--userspace",
             "--udid", self._current_udid,
             "--env", "MJPEG_SERVER_SCREENSHOT_QUALITY=55",
             "--env", "MJPEG_SCALING_FACTOR=50",
