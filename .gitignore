@@ -12,6 +12,8 @@ build/
 dist/
 *.egg-info/
 *.spec
+# py2app leftovers
+setup.cfg
 
 # macOS
 .DS_Store

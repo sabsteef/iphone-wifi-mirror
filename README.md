@@ -53,6 +53,18 @@ You do **not** need:
 
 The setup has three parts. The first two you do **once**. The third — signing WebDriverAgent — needs to be redone every ~7 days if you're on the free Apple Developer tier (that's Apple's certificate expiry, not ours).
 
+### Build the Mac app (optional)
+
+If you'd rather double-click a `.app` from `/Applications` than run `./run.sh` from Terminal, build the bundle after the install script finishes:
+
+```bash
+./.venv/bin/pip install py2app
+./.venv/bin/python setup.py py2app
+cp -R "dist/iPhone Mirror.app" /Applications/
+```
+
+The resulting bundle is ~400 MB (it includes a full Python + PyQt6 runtime) and is ad-hoc signed — Gatekeeper may ask you to right-click → Open the first time. All other setup steps below still apply — the .app is just a nicer launcher.
+
 ### Part 1 — Prepare the Mac
 
 ```bash
