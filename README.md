@@ -53,9 +53,9 @@ You do **not** need:
 
 The setup has three parts. The first two you do **once**. The third — signing WebDriverAgent — needs to be redone every ~7 days if you're on the free Apple Developer tier (that's Apple's certificate expiry, not ours).
 
-### Build the Mac app (optional)
+### Build the Mac app yourself (optional)
 
-If you'd rather double-click a `.app` from `/Applications` than run `./run.sh` from Terminal, build the bundle after the install script finishes:
+If you want to build your own `.app` bundle from source instead of using the Homebrew Cask above (e.g. after code changes), do this after `./install.sh`:
 
 ```bash
 ./.venv/bin/pip install py2app
@@ -63,25 +63,29 @@ If you'd rather double-click a `.app` from `/Applications` than run `./run.sh` f
 cp -R "dist/iPhone Mirror.app" /Applications/
 ```
 
-The resulting bundle is ~400 MB (it includes a full Python + PyQt6 runtime) and is ad-hoc signed — Gatekeeper may ask you to right-click → Open the first time. All other setup steps below still apply — the .app is just a nicer launcher.
+The resulting bundle is ~410 MB (it includes a full Python + PyQt6 runtime).
 
-### Part 1 — Prepare the Mac
+### Part 1 — Install the Mac app
+
+**Option A — Homebrew (recommended, one command):**
 
 ```bash
-git clone https://github.com/YOUR-USERNAME/iphone-wifi-mirror.git
+brew tap sabsteef/tap
+brew trust sabsteef/tap        # tap is not the official homebrew-cask repo
+brew install --cask iphone-wifi-mirror
+```
+
+That drops `iPhone Mirror.app` straight into `/Applications`. Because the bundle is ad-hoc signed (no paid Apple Developer subscription used), macOS Gatekeeper may prompt to right-click → **Open** on first launch — once. Everything else about the setup below is the same.
+
+**Option B — build from source:**
+
+```bash
+git clone https://github.com/sabsteef/iphone-wifi-mirror.git
 cd iphone-wifi-mirror
 ./install.sh
 ```
 
-The installer will:
-
-- Install [Homebrew](https://brew.sh/) if it isn't already
-- Install Python 3.14 via Homebrew
-- Create a `.venv/` virtual environment
-- Install Python dependencies from `requirements.txt`
-- Create the `run.sh` launcher
-
-No admin password required.
+The installer installs Homebrew (if missing), Python 3.14, a `.venv/`, and the Python dependencies. Launch with `./run.sh`. No admin password required.
 
 ### Part 2 — Pair your iPhone
 
