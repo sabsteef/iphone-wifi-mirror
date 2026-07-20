@@ -74,23 +74,47 @@ cd iphone-wifi-mirror
 
 Installs Homebrew (if missing), Python 3.14, a `.venv/`, and the Python dependencies. Launch later with `./run.sh`. No admin password required.
 
-### Part 2 — Pair your iPhone
+### Part 2 — Enable Developer Mode & pair your iPhone
 
-Only needed once per iPhone. Enable Developer Mode first:
+Only needed once per iPhone. The order matters — do these steps in sequence.
 
-**On the iPhone:**
+#### 2a. Turn on Developer Mode (iPhone side)
 
-1. **Settings → Privacy & Security → Developer Mode → On** (requires a restart)
-2. Plug the iPhone into your Mac with a USB cable
-3. Accept the **"Trust this Computer?"** dialog when it appears
+The Developer Mode menu is **hidden by default** on iOS 17+. It only appears in Settings *after* the iPhone has been talked to by a developer tool at least once. Xcode is the easiest way to trigger this — even just plugging in is enough on many devices, but explicitly connecting with Xcode always works.
 
-**On the Mac:**
+1. **Install Xcode** on your Mac (from the App Store) if you haven't already
+2. Plug the iPhone into the Mac with a USB cable — a real Apple/MFi cable, not a random no-name one
+3. On the iPhone: accept the **"Trust This Computer?"** prompt and enter your passcode
+4. On the Mac: open **Xcode → Window → Devices and Simulators** (`⌘⇧2`). Your iPhone should appear in the left sidebar. Wait until it stops showing "Preparing debugger support" (can take a minute the first time)
+5. Now on the iPhone: **Settings → Privacy & Security → scroll down → Developer Mode**  
+   ⤷ If **Developer Mode** is not there, disconnect the cable, wait 5s, reconnect. It should appear.
+6. Toggle **Developer Mode → On**
+7. iPhone will ask to restart — restart it
+8. After restart, iPhone shows a "Turn On Developer Mode" prompt. Tap **Turn On**, enter your passcode
+
+Verify by going back to **Settings → Privacy & Security → Developer Mode** — the toggle should now be green.
+
+#### 2b. Pair the iPhone with pymobiledevice3 (Mac side)
+
+With the cable still plugged in:
 
 ```bash
 sudo pymobiledevice3 remote pair
 ```
 
-Follow the prompt on your iPhone to confirm the pairing. When it's done, unplug the cable — you'll do everything over WiFi from here on.
+You'll get an authentication prompt on the iPhone — accept it and enter your passcode. This creates a **persistent trust record** on both sides so the Mac can talk to the iPhone over WiFi from now on.
+
+Once paired, unplug the USB cable. Everything else runs over WiFi.
+
+> **Both devices must be on the same WiFi network.** If your router has separate 2.4 GHz and 5 GHz SSIDs, join both devices to the *same* one — some mesh routers isolate clients across bands.
+
+#### 2c. Sanity check
+
+```bash
+pymobiledevice3 usbmux list
+```
+
+Should print at least one entry with your iPhone's UDID. If it doesn't, redo step 2b — the pairing didn't take.
 
 ### Part 3 — Build & install WebDriverAgent
 
@@ -106,15 +130,19 @@ cd WebDriverAgent
 open WebDriverAgent.xcodeproj
 ```
 
-**In Xcode:**
+**Add your Apple ID to Xcode first** (once per Mac): **Xcode → Settings → Accounts → +** → Apple ID → sign in with your regular iCloud account. You'll see a "Personal Team" appear underneath — that's what you'll pick as "Team" below.
 
-1. In the sidebar, pick the **WebDriverAgent** project (blue icon at top)
-2. Select target **WebDriverAgentRunner** (or `WebDriverAgentRunner_tvOS` if you're on Apple TV — you probably aren't)
-3. Under **Signing & Capabilities**:
-   - ✅ Automatically manage signing
-   - **Team**: pick your personal Apple ID
-   - **Bundle Identifier**: change to your unique one (e.g. `com.jdoe.WebDriverAgentRunner`)
-4. Repeat for the **IntegrationApp** target (any unique bundle ID; won't be used at runtime but must be signable)
+**In Xcode with the WebDriverAgent project open:**
+
+1. In the left sidebar, click the top **WebDriverAgent** project entry (blue project icon)
+2. In the target list next to it, select **WebDriverAgentRunner** (skip `WebDriverAgentRunner_tvOS` unless you're on Apple TV)
+3. Open the **Signing & Capabilities** tab (top row of the middle pane)
+4. Configure:
+   - ✅ **Automatically manage signing**
+   - **Team**: pick "*Your Name* (Personal Team)"
+   - **Bundle Identifier**: change from `com.facebook.WebDriverAgentRunner` to your own unique one — e.g. `com.jdoe.WebDriverAgentRunner`
+5. Now click the target **IntegrationApp** and do the same: pick your Team, change the Bundle Identifier to something unique (e.g. `com.jdoe.WebDriverAgentIntegration`). Won't run at runtime but Xcode refuses to build if it can't sign
+6. If Xcode shows a red **"Failed to register bundle identifier"** or **"Provisioning profile requires the Push Notifications capability"** error: check that the bundle IDs really are unique across all your Apple IDs, and that `Automatically manage signing` is ticked so Xcode creates the profile itself
 
 **Build for your device:**
 
