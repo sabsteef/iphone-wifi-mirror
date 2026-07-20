@@ -37,3 +37,9 @@ WebDriverAgent/*.xcworkspace/xcuserdata/
 # Local overrides
 .env
 .env.local
+
+# Claude Code / AI assistant artifacts — never public
+CLAUDE.md
+FINDINGS.md
+.claude/
+.backup/

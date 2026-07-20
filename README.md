@@ -291,7 +291,7 @@ src/
 └── device_models.py        ProductType → friendly name + screen size
 ```
 
-See [FINDINGS.md](FINDINGS.md) for the reverse-engineering notes and design decisions.
+Design decisions and reverse-engineering notes live in the commit history and in-code comments.
 
 ---
 
