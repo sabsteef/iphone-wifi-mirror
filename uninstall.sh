@@ -1,6 +1,7 @@
 #!/bin/bash
-# iPhone Mirror — uninstaller (v9)
-# Verwijdert venv + eventuele v7-legacy tunnel service.
+# iPhone WiFi Mirror — uninstaller
+# Removes the virtualenv. Doesn't touch WebDriverAgent on the phone —
+# uninstall that via iOS Settings → General → VPN & Device Management.
 
 set -e
 
@@ -16,32 +17,19 @@ info() { echo -e "${BLUE}==>${NC} $1"; }
 ok()   { echo -e "${GREEN}✓${NC} $1"; }
 warn() { echo -e "${YELLOW}!${NC} $1"; }
 
-info "iPhone Mirror uninstaller"
-
-# v7 legacy — als hij er is, ruim hem op
-LEGACY_PLIST="/Library/LaunchDaemons/com.sabsteef.iphonemirror.tunneld.plist"
-LEGACY_SUDOERS="/etc/sudoers.d/iphonemirror"
-LEGACY_LOG="/var/log/iphonemirror-tunneld.log"
-
-if [[ -f "$LEGACY_PLIST" ]] || [[ -f "$LEGACY_SUDOERS" ]] || [[ -f "$LEGACY_LOG" ]]; then
-    info "v7 tunnel service opruimen (vraagt admin wachtwoord)"
-    sudo bash -c "
-        /bin/launchctl unload '$LEGACY_PLIST' 2>/dev/null || true
-        rm -f '$LEGACY_PLIST' '$LEGACY_SUDOERS' '$LEGACY_LOG'
-    "
-    ok "v7 service verwijderd"
-else
-    ok "Geen v7 service om op te ruimen"
-fi
+info "iPhone WiFi Mirror uninstaller"
 
 if [[ -d "$SCRIPT_DIR/.venv" ]]; then
-    read -p "Verwijder virtual environment (.venv)? [y/N] " -n 1 -r
+    read -p "Remove virtual environment (.venv)? [y/N] " -n 1 -r
     echo
     if [[ $REPLY =~ ^[Yy]$ ]]; then
         rm -rf "$SCRIPT_DIR/.venv"
-        ok "Venv verwijderd"
+        ok "Venv removed"
     fi
 fi
 
 echo
-ok "Uninstall voltooid"
+warn "The WebDriverAgent runner is still installed on your iPhone."
+warn "Remove it via iOS Settings → General → VPN & Device Management → your Apple ID."
+echo
+ok "Uninstall complete"

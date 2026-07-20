@@ -58,7 +58,7 @@ src/
 - **CoreDevice HID** heeft alleen home/power/volume buttons — geen coordinate taps
 - **WDA** doet tap, swipe, drag, pinch, keys via HTTP API
 - WDA gebouwd + gesigned met eigen Apple Developer account (Personal Team)
-- Custom bundle ID: `com.sabsteef.WebDriverAgentRunner.xctrunner`
+- Custom bundle ID: `com.example.WebDriverAgentRunner.xctrunner`
 - Auth token via `Authorization: Bearer <token>` header (source-patched in `FBWebServer.m`)
 
 ### Waarom MJPEG > DVT screenshot
@@ -148,7 +148,7 @@ xcodebuild build-for-testing \
   -scheme WebDriverAgentRunner \
   -destination generic/platform=iOS \
   -derivedDataPath /tmp/wda-build \
-  DEVELOPMENT_TEAM=9K69U4QGW6 \
+  DEVELOPMENT_TEAM=<YOUR_TEAM_ID> \
   -allowProvisioningUpdates
 
 # WDA install

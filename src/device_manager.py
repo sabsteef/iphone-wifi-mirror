@@ -31,8 +31,11 @@ from PyQt6.QtCore import QObject, pyqtSignal
 
 from pymobiledevice3.bonjour import browse_mobdev2
 from pymobiledevice3.remote.remote_service_discovery import RemoteServiceDiscoveryService
+from pymobiledevice3.services.dvt.instruments.dvt_provider import DvtProvider
+from pymobiledevice3.services.dvt.instruments.process_control import ProcessControl
 from pymobiledevice3.usbmux import list_devices as usbmux_list_devices
 
+from src.tunnel_forwarder import TunnelForwarder
 from src.tunnel_manager import (
     STATUS_CONNECTED,
     STATUS_FAILED,
@@ -75,7 +78,15 @@ class DeviceManager(QObject):
     connection_state_changed = pyqtSignal(ConnectionState)
     tunnel_status_changed = pyqtSignal(str, str)  # (status, reason)
 
-    WDA_BUNDLE_ID = "com.sabsteef.WebDriverAgentRunner.xctrunner"
+    # Bundle ID of the signed WebDriverAgentRunner app on the iPhone.
+    # Every user must sign their own build with their Apple Developer
+    # account, so this MUST be overridable per install. Set the
+    # WDA_BUNDLE_ID env var to the value you used when building WDA.
+    # See README.md → "Build & install WebDriverAgent".
+    WDA_BUNDLE_ID = os.environ.get(
+        "WDA_BUNDLE_ID",
+        "com.example.WebDriverAgentRunner.xctrunner",
+    )
     DISCOVERY_INTERVAL_S = 2.0
 
     def __init__(self, parent: Optional[QObject] = None):
@@ -90,6 +101,16 @@ class DeviceManager(QObject):
         self._discovery_task: Optional[asyncio.Task] = None
         self._connect_task: Optional[asyncio.Task] = None
         self._stop_discovery = asyncio.Event()
+        # Optional callback invoked BEFORE stop_wda kills xcuitest — gives
+        # the InputHandler a chance to POST /wda/shutdown so the
+        # WebDriverAgentRunner app on the iPhone terminates itself
+        # cleanly. Runs synchronously; must be fast (few hundred ms).
+        self._on_pre_stop_wda: Optional[callable] = None
+        # HTTP-to-userspace-tunnel bridge for WDA (port 8100). None until
+        # a tunnel is up. The stdlib ``requests`` client used by input_handler
+        # cannot reach the RSD's IPv6 directly (OS sockets do not see the
+        # in-process TCP stack), so we bind localhost and splice.
+        self._wda_forwarder: Optional[TunnelForwarder] = None
 
     # ────────────────────────────── public state ─────────────────────────────
 
@@ -129,10 +150,17 @@ class DeviceManager(QObject):
             self._switch_task.add_done_callback(_log_task_exception("device-switch disconnect"))
 
     def get_wda_url(self) -> str:
-        rsd = self._tunnel_mgr.rsd
-        if rsd is None or not rsd.service.address:
-            return "http://localhost:8100"
-        return f"http://[{rsd.service.address[0]}]:8100"
+        """URL that stdlib HTTP clients (``requests``) can actually reach.
+
+        Behind the scenes this is a localhost socket that the forwarder
+        splices into the userspace tunnel's port 8100. The forwarder is
+        started as part of :meth:`_connect`; if it hasn't come up yet we
+        fall back to a placeholder that will fail cleanly rather than
+        hand out a URL nothing can dial.
+        """
+        if self._wda_forwarder is not None and self._wda_forwarder.local_port:
+            return f"http://127.0.0.1:{self._wda_forwarder.local_port}"
+        return "http://127.0.0.1:0"
 
     # ────────────────────────────── discovery ────────────────────────────────
 
@@ -148,6 +176,10 @@ class DeviceManager(QObject):
             self._discovery_task.cancel()
 
     async def _discovery_loop(self) -> None:
+        # Consecutive failure counter so a persistently broken discovery
+        # path (e.g. usbmux socket gone) becomes visible in the log
+        # instead of ticking away silently on DEBUG.
+        fail_streak = 0
         try:
             while not self._stop_discovery.is_set():
                 if self._state != ConnectionState.CONNECTED and (
@@ -160,8 +192,24 @@ class DeviceManager(QObject):
                             self._connect_task = asyncio.ensure_future(
                                 self._connect(best["udid"])
                             )
+                        fail_streak = 0
                     except Exception as e:
-                        logger.debug("Discovery iteration error: %s", e)
+                        fail_streak += 1
+                        # First failure logs DEBUG (transient hiccup expected
+                        # during boot). After 3 in a row, escalate so a
+                        # broken discovery path stops hiding.
+                        if fail_streak == 3:
+                            logger.warning(
+                                "Discovery has failed %d times in a row: %s",
+                                fail_streak, e, exc_info=e,
+                            )
+                        elif fail_streak > 3 and fail_streak % 15 == 0:
+                            logger.warning(
+                                "Discovery still failing (%d attempts): %s",
+                                fail_streak, e,
+                            )
+                        else:
+                            logger.debug("Discovery iteration error: %s", e)
                 try:
                     await asyncio.wait_for(
                         self._stop_discovery.wait(),
@@ -249,6 +297,7 @@ class DeviceManager(QObject):
                 "udid": rsd.udid,
                 "connection_type": "tunnel",
             }
+            await self._start_wda_forwarder(rsd)
             self._set_state(ConnectionState.CONNECTED)
             self.device_connected.emit(self._device_info)
             logger.info(
@@ -258,15 +307,55 @@ class DeviceManager(QObject):
                 self._device_info["ios_version"],
             )
         except Exception as e:
-            logger.error("Tunnel connect failed for %s: %s", udid, e)
+            # Some pymobiledevice3 errors render as empty strings via
+            # __str__ — include the type name and stack so a persistent
+            # connect failure (iOS 27 WiFi tunnel drop, dev image not
+            # mounted, developer mode off) is actually diagnosable.
+            logger.error(
+                "Tunnel connect failed for %s: %s: %s",
+                udid, type(e).__name__, e or "<no message>",
+                exc_info=e,
+            )
             self._set_state(ConnectionState.ERROR)
-            self.connection_error.emit(str(e))
+            self.connection_error.emit(
+                f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+            )
+
+    async def _start_wda_forwarder(self, rsd) -> None:
+        """(Re)start the localhost → tunnel forwarder that carries WDA HTTP.
+
+        Idempotent: closes any prior forwarder first so we never leak a
+        listener on a stale RSD after a reconnect.
+        """
+        await self._stop_wda_forwarder()
+        fwd = TunnelForwarder(rsd, remote_port=8100, label="wda-8100")
+        try:
+            port = await fwd.start()
+        except Exception as e:
+            logger.error("Failed to start WDA forwarder: %s", e)
+            raise
+        self._wda_forwarder = fwd
+        logger.info("WDA forwarder up on 127.0.0.1:%d -> tunnel:8100", port)
+
+    async def _stop_wda_forwarder(self) -> None:
+        if self._wda_forwarder is None:
+            return
+        try:
+            await self._wda_forwarder.close()
+        except Exception as e:
+            logger.debug("WDA forwarder close raised: %s", e)
+        self._wda_forwarder = None
 
     async def _safe_get_value(self, rsd, key: str, default: str = "") -> str:
         try:
             v = await rsd.get_value(key=key)
             return v or default
-        except Exception:
+        except Exception as e:
+            # A single miss on `DeviceName` etc. isn't fatal, but silently
+            # returning "iPhone" for every device (which is what happens
+            # if lockdown lost its handshake) hides the real problem. Log
+            # so the wrong-device-name UI has a trail.
+            logger.debug("get_value(%s) failed: %s", key, e)
             return default
 
     # ────────────────────────────── WDA lifecycle ────────────────────────────
@@ -317,6 +406,13 @@ class DeviceManager(QObject):
                 wda_log.close()
                 logger.error("WDA exited early: %s", output[-500:])
                 self._wda_proc = None
+                # xcuitest exited before we could rely on stop_wda for
+                # cleanup; unlink the log ourselves.
+                try:
+                    os.unlink(self._wda_log_path)
+                except Exception:
+                    pass
+                self._wda_log_path = None
                 return False
             wda_log.close()  # subprocess still holds its own dup'd fd
             logger.info(
@@ -329,12 +425,27 @@ class DeviceManager(QObject):
                 wda_log.close()
             except Exception:
                 pass
+            try:
+                os.unlink(self._wda_log_path)
+            except Exception:
+                pass
+            self._wda_log_path = None
             logger.error("Failed to start WDA: %s", e)
             return False
 
     def stop_wda(self) -> None:
         if not self._wda_proc:
             return
+        # Ask the runner to shut itself down FIRST (while the tunnel is
+        # still open). If this succeeds iOS terminates the WDA app on
+        # the phone within a second; if it fails (tunnel already gone)
+        # we fall through to the xcuitest kill and let iOS reap the
+        # runner via its heartbeat loss.
+        if self._on_pre_stop_wda is not None:
+            try:
+                self._on_pre_stop_wda()
+            except Exception as e:
+                logger.debug("pre_stop_wda callback raised: %s", e)
         proc = self._wda_proc
         try:
             pgid = os.getpgid(proc.pid)
@@ -346,7 +457,10 @@ class DeviceManager(QObject):
             except Exception:
                 pass
         try:
-            proc.wait(timeout=3)
+            # 2s is plenty for xcuitest to close cleanly on SIGTERM;
+            # beyond that we go straight to SIGKILL so shutdown stays
+            # snappy.
+            proc.wait(timeout=2)
         except Exception:
             try:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
@@ -356,6 +470,18 @@ class DeviceManager(QObject):
                 except Exception:
                     pass
         self._wda_proc = None
+        # Unlink the tempfile we created in start_wda so /tmp doesn't
+        # collect a wda-*.log for every restart. Only best-effort; if the
+        # file's gone (test env, someone rotated it) we don't care.
+        log_path = getattr(self, "_wda_log_path", None)
+        if log_path:
+            try:
+                os.unlink(log_path)
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                logger.debug("WDA log unlink failed: %s", e)
+            self._wda_log_path = None
         logger.info("WDA xcuitest stopped")
 
     def is_wda_running(self) -> bool:
@@ -374,10 +500,19 @@ class DeviceManager(QObject):
         if status == STATUS_LOST:
             logger.warning("Tunnel lost: %s — killing WDA until reconnect", reason)
             self.stop_wda()
+            # Old forwarder holds a stale RSD; tear it down so new HTTP
+            # calls fast-fail against the empty local port until the
+            # reconnect handler builds a fresh one.
+            t = asyncio.ensure_future(self._stop_wda_forwarder())
+            t.add_done_callback(_log_task_exception("stop wda forwarder on tunnel loss"))
             if self._state == ConnectionState.CONNECTED:
                 self._set_state(ConnectionState.CONNECTING)
         elif status == STATUS_RECONNECTED:
             logger.info("Tunnel reconnected: %s", reason)
+            rsd = self._tunnel_mgr.rsd
+            if rsd is not None:
+                t = asyncio.ensure_future(self._start_wda_forwarder(rsd))
+                t.add_done_callback(_log_task_exception("restart wda forwarder on reconnect"))
             self._set_state(ConnectionState.CONNECTED)
             self.device_connected.emit(self._device_info)
         elif status == STATUS_FAILED:
@@ -385,10 +520,51 @@ class DeviceManager(QObject):
             self._set_state(ConnectionState.ERROR)
             self.connection_error.emit(f"Tunnel dropped and could not recover: {reason}")
 
+    async def _terminate_wda_on_device(self) -> bool:
+        """Kill the WebDriverAgentRunner app on the iPhone via DVT."""
+        rsd = self._tunnel_mgr.rsd
+        if rsd is None:
+            logger.info("Terminate-WDA-on-device: no RSD, skipping")
+            return False
+        logger.info("Terminate-WDA-on-device: connecting DVT…")
+        try:
+            return await asyncio.wait_for(self._do_terminate_wda(rsd), timeout=5.0)
+        except asyncio.TimeoutError:
+            logger.warning("Terminate-WDA-on-device: overall timeout after 5s")
+            return False
+        except Exception as e:
+            logger.warning("Terminate-WDA-on-device raised %s: %s", type(e).__name__, e)
+            return False
+
+    async def _do_terminate_wda(self, rsd) -> bool:
+        async with DvtProvider(rsd) as dvt:
+            logger.info("Terminate-WDA-on-device: DVT open, connecting process control…")
+            pc = ProcessControl(dvt)
+            await pc.connect()
+            logger.info("Terminate-WDA-on-device: looking up pid for %s", self.WDA_BUNDLE_ID)
+            pid = await pc.process_identifier_for_bundle_identifier(self.WDA_BUNDLE_ID)
+            if not pid:
+                logger.info("Terminate-WDA-on-device: no pid found")
+                return False
+            logger.info("Terminate-WDA-on-device: killing pid %d", pid)
+            await pc.kill(pid)
+            logger.info("Terminate-WDA-on-device: kill sent")
+            return True
+
     # ────────────────────────────── shutdown ─────────────────────────────────
 
     async def disconnect(self) -> None:
+        # 1. Ask iOS to terminate the WebDriverAgentRunner app FIRST
+        #    (while the RSD tunnel is still up). If we skipped this and
+        #    just killed the local xcuitest, the on-device runner would
+        #    linger until iOS's XCTest heartbeat timeout — which is
+        #    exactly the "WDA blijft draaien" symptom.
+        await self._terminate_wda_on_device()
+        # 2. Kill the local xcuitest subprocess (also does its own
+        #    pre-stop callback that hits POST /wda/shutdown as a
+        #    backup; a no-op on WDA builds that don't route it).
         self.stop_wda()
+        await self._stop_wda_forwarder()
         await self._tunnel_mgr.disconnect()
         self._current_udid = None
         self._device_info = {}

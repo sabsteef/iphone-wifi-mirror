@@ -68,7 +68,12 @@ def apply_dark_palette(app: QApplication) -> None:
 
 async def _shutdown(window: MainWindow) -> None:
     logging.info("Graceful shutdown starting")
-    await window.async_close()
+    try:
+        await asyncio.wait_for(window.async_close(), timeout=15.0)
+    except asyncio.TimeoutError:
+        logging.error("async_close did not finish in 15s — forcing quit")
+    except Exception as e:
+        logging.error("async_close raised: %s", e, exc_info=e)
     QApplication.instance().quit()
 
 
@@ -91,12 +96,26 @@ def main() -> None:
     window = MainWindow()
     window.show()
 
-    def _handle_signal(*_):
+    def _handle_signal():
         logging.info("Signal received, shutting down")
         asyncio.ensure_future(_shutdown(window))
 
-    signal.signal(signal.SIGTERM, _handle_signal)
-    signal.signal(signal.SIGINT, _handle_signal)
+    # loop.add_signal_handler dispatches the coroutine on the actual
+    # running loop instead of latching onto whatever thread happens to
+    # receive the signal. With qasync + Qt, signal.signal() delivers on
+    # the main thread but the callback runs BEFORE the loop picks up its
+    # next iteration, so ensure_future can miss and shutdown never
+    # fires. add_signal_handler is the documented supported path.
+    #
+    # It's Unix-only; on Windows fall back to signal.signal (SIGTERM
+    # doesn't exist there anyway, only SIGINT).
+    try:
+        loop.add_signal_handler(signal.SIGTERM, _handle_signal)
+        loop.add_signal_handler(signal.SIGINT, _handle_signal)
+    except NotImplementedError:
+        signal.signal(signal.SIGINT, lambda *_: _handle_signal())
+        if hasattr(signal, "SIGTERM"):
+            signal.signal(signal.SIGTERM, lambda *_: _handle_signal())
 
     # Kick off the async device discovery now that the loop is bound to the
     # Qt application.

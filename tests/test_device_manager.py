@@ -186,5 +186,13 @@ async def test_wda_url_uses_rsd_address(qapp, monkeypatch):
     dm = device_manager.DeviceManager()
     await dm._connect("A")
     url = dm.get_wda_url()
-    assert url == "http://[fd00::1]:8100"
+    # WDA is reached through a localhost forwarder, not the raw RSD IPv6,
+    # because stdlib HTTP clients (requests) can't route to the in-process
+    # userspace tunnel. The forwarder picks a dynamic port at bind time.
+    assert url.startswith("http://127.0.0.1:")
+    forwarder = dm._wda_forwarder
+    assert forwarder is not None
+    assert forwarder.local_port is not None and forwarder.local_port > 0
     await dm.cleanup()
+    # After cleanup the forwarder must be gone so tests don't leak sockets.
+    assert dm._wda_forwarder is None

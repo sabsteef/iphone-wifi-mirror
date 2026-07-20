@@ -89,9 +89,15 @@ class ScreenView(QWidget):
                 Qt.AspectRatioMode.KeepAspectRatio,
                 Qt.TransformationMode.SmoothTransformation,
             )
-            x = (self.width() - scaled.width()) / 2
-            y = (self.height() - scaled.height()) / 2
-            painter.drawPixmap(int(x), int(y), scaled)
+            # Use int-truncated origin to match what drawPixmap uses,
+            # then hand the exact same numbers to the input handler so
+            # its coordinate translation cannot drift due to rounding.
+            x = int((self.width() - scaled.width()) / 2)
+            y = int((self.height() - scaled.height()) / 2)
+            painter.drawPixmap(x, y, scaled)
+            self._input_handler.set_display_geometry(
+                x, y, scaled.width(), scaled.height()
+            )
         else:
             painter.setPen(QColor("#888"))
             font = QFont()
@@ -402,6 +408,11 @@ class MainWindow(QMainWindow):
         if preferred:
             self.device_manager.set_preferred_udid(preferred)
         self.input_handler = InputHandler(self)
+        # When device_manager is about to kill the xcuitest subprocess,
+        # give the WDAClient a chance to POST /wda/shutdown so the
+        # runner app on the iPhone terminates itself instead of leaking
+        # until iOS's XCTest heartbeat times out.
+        self.device_manager._on_pre_stop_wda = self.input_handler.wda.disconnect
         self.capture_thread = None
         self._connected = False
 
@@ -414,6 +425,12 @@ class MainWindow(QMainWindow):
         self._wda_retry_timer = QTimer(self)
         self._wda_retry_timer.timeout.connect(self._try_wda)
         self._wda_retry_timer.setInterval(5000)
+        # Cap WDA retry attempts so a permanently broken WDA install
+        # (missing bundle id, expired provisioning profile, unpaired
+        # device) doesn't spam the log and executor forever. Reset on
+        # every connect success in _on_wda_status.
+        self._wda_retry_attempt = 0
+        self._wda_retry_max = 24  # 24 × 5s = ~2 minutes of retries
 
         self._keepalive_timer = QTimer(self)
         self._keepalive_timer.timeout.connect(self._keep_alive)
@@ -490,18 +507,53 @@ class MainWindow(QMainWindow):
         self._status_label.setText("Tunnel opzetten…")
 
     async def async_close(self) -> None:
-        """Async teardown called from the signal handler / close event."""
+        """Async teardown called from the signal handler / close event.
+
+        Every step is time-bounded so a stuck subsystem can't hang the
+        whole shutdown — an unresponsive tunnel/WDA/subprocess must not
+        leave the process alive forever (which is what happened in an
+        earlier test run where the app ignored SIGTERM entirely).
+        """
         settings = QSettings("iPhoneMirroring", "iPhoneMirror")
         settings.setValue("window/pos", self.pos())
         self._stop_capture()
-        self.input_handler.cleanup()
+        # WDA HTTP DELETE session can block if the forwarder is already
+        # tearing down — run in an executor with a hard timeout.
+        try:
+            loop = asyncio.get_event_loop()
+            await asyncio.wait_for(
+                loop.run_in_executor(None, self.input_handler.cleanup),
+                timeout=3.0,
+            )
+        except (asyncio.TimeoutError, Exception) as e:
+            logger.warning("input_handler.cleanup timed out or raised: %s", e)
         task = getattr(self, "_devices_refresh_task", None)
         if task is not None and not task.done():
             task.cancel()
+        # If a WDA subprocess spawn is still in flight (executor future
+        # scheduled but Popen not yet returned), wait briefly for it so
+        # device_manager.cleanup() actually sees the process and kills
+        # it, instead of letting the xcuitest runner orphan on-device.
+        wda_future = getattr(self, "_wda_start_future", None)
+        if wda_future is not None and not wda_future.done():
+            try:
+                await asyncio.wait_for(asyncio.wrap_future(wda_future), timeout=6.0)
+            except asyncio.TimeoutError:
+                logger.warning("WDA start future did not finish before shutdown")
+            except Exception as e:
+                logger.debug("WDA start future raised on shutdown: %s", e)
         try:
-            await self.device_manager.cleanup()
+            await asyncio.wait_for(self.device_manager.cleanup(), timeout=8.0)
+        except asyncio.TimeoutError:
+            logger.warning("device_manager.cleanup did not finish in 8s")
         except Exception as e:
             logger.warning("device_manager.cleanup: %s", e)
+        # Belt-and-braces: stop the Qt loop explicitly so any remaining
+        # timer/callback can't keep it alive past shutdown.
+        try:
+            asyncio.get_event_loop().stop()
+        except Exception:
+            pass
 
     def _setup_ui(self):
         central = QWidget()
@@ -760,8 +812,15 @@ class MainWindow(QMainWindow):
             logger.debug("Discovery restart after disconnect failed: %s", e)
 
     def _on_connection_error(self, msg: str):
-        self._status_label.setText("Error")
-        QMessageBox.warning(self, "Connection Error", msg)
+        # Discovery retries every 2s. If we popped a modal for each emission,
+        # the user would get an inescapable "click OK" loop and could not
+        # even open Settings to pick a different device. Show it inline in
+        # the status label; only log the first repeated message at WARNING.
+        truncated = (msg[:80] + "…") if len(msg) > 80 else msg
+        self._status_label.setText(f"Error: {truncated}")
+        if getattr(self, "_last_conn_error_msg", None) != msg:
+            logger.warning("Connection error: %s", msg)
+            self._last_conn_error_msg = msg
 
     def _on_state_changed(self, state: ConnectionState):
         labels = {
@@ -792,10 +851,17 @@ class MainWindow(QMainWindow):
 
     def _on_fps(self, fps: float):
         self._fps_label.setText(f"{fps:.0f} FPS")
+        logger.debug("FPS %.1f", fps)
 
     def _on_capture_error(self, msg: str):
         logger.warning("Capture error: %s", msg)
         self._status_label.setText(f"Error: {msg[:50]}")
+        # If MJPEG couldn't reach WDA the xcuitest subprocess is likely
+        # still running (its HTTP side may or may not be up). Stop it so
+        # the next connect starts clean instead of racing an orphan.
+        if "MJPEG" in msg and self.device_manager.is_wda_running():
+            logger.info("Stopping orphan WDA subprocess after MJPEG give-up")
+            self.device_manager.stop_wda()
 
     def _start_wda_auto(self):
         token = wda_auth.get_or_create_token()
@@ -806,11 +872,29 @@ class MainWindow(QMainWindow):
         # start_wda is a subprocess spawn (blocking ~5s while it waits for
         # xcuitest to come up). Run it in an executor to keep the UI responsive.
         loop = asyncio.get_event_loop()
-        loop.run_in_executor(None, self.device_manager.start_wda, token)
+        # Track the future so shutdown can wait for it (or at least know
+        # it exists) instead of racing stop_wda against a not-yet-spawned
+        # subprocess.
+        self._wda_start_future = loop.run_in_executor(
+            None, self.device_manager.start_wda, token,
+        )
+        # Fresh connect → fresh retry budget.
+        self._wda_retry_attempt = 0
         self._wda_retry_timer.start()
 
     def _try_wda(self):
         if self.input_handler.wda.is_connected:
+            self._wda_retry_attempt = 0
+            return
+        self._wda_retry_attempt += 1
+        if self._wda_retry_attempt > self._wda_retry_max:
+            logger.warning(
+                "WDA still unreachable after %d attempts — stopping retry timer. "
+                "Reconnect on the next tunnel/device event.",
+                self._wda_retry_attempt - 1,
+            )
+            self._wda_retry_timer.stop()
+            self._status_label.setText("WDA niet bereikbaar — check iPhone")
             return
         token = wda_auth.get_or_create_token()
         self.input_handler.wda.set_auth_token(token)
@@ -825,6 +909,7 @@ class MainWindow(QMainWindow):
     def _on_wda_status(self, connected: bool):
         self._wda_banner.setVisible(not connected)
         if connected:
+            self._wda_retry_attempt = 0
             logger.info("WDA connected — touch control enabled")
 
     def _keep_alive(self):
@@ -880,13 +965,32 @@ class MainWindow(QMainWindow):
         self.device_manager.start_discovery()
 
     def closeEvent(self, event):
-        # main.py's signal handler will call async_close via the event loop.
-        # For a normal close-button click, kick off the same async teardown.
+        # Red-cross close would otherwise accept the event immediately,
+        # tearing down the Qt window and stopping the qasync loop before
+        # async_close finishes — which leaves the WDA runner alive on
+        # the iPhone (CLAUDE.md documents the v7 fix but it stopped
+        # working after v9's in-process userspace tunnel: the tunnel
+        # dies with the loop before killpg fires). Fix: ignore the
+        # first close event, run async_close to completion, then
+        # actually quit.
+        if getattr(self, "_closing", False):
+            super().closeEvent(event)
+            return
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
-                task = asyncio.ensure_future(self.async_close())
+                self._closing = True
+                event.ignore()
+
+                async def _finish():
+                    try:
+                        await self.async_close()
+                    finally:
+                        QApplication.instance().quit()
+
+                task = asyncio.ensure_future(_finish())
                 task.add_done_callback(_log_task_exception("close-event async teardown"))
+                return
         except RuntimeError:
             pass
         super().closeEvent(event)

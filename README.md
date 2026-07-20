@@ -1,185 +1,311 @@
-# iPhone Mirror
+# iPhone WiFi Mirror
 
-Mirror en bedien je iPhone-scherm vanaf macOS over WiFi. Alternatief voor Apple's iPhone Mirroring dat in de EU nog niet beschikbaar is.
+Mirror and control your iPhone from macOS over WiFi. An open-source alternative to Apple's **iPhone Mirroring** feature, which — at time of writing — is unavailable in the European Union.
 
-## Features
+- **Full touch control** (tap, swipe, scroll, pinch-to-zoom, drag, long-press, keyboard input, passcode unlock)
+- **No cable required** after initial pairing
+- **No sudo, no LaunchDaemons, no background services** — everything runs in-process
+- **Auto-reconnect** with health-monitored tunnels: WiFi drops recover automatically
+- **iPhone-shaped frameless window** with true device dimensions (widget + Dynamic Island cutout)
+- **~9-10 FPS** live MJPEG stream with tunable quality
 
-- WiFi screen mirroring via pymobiledevice3 v9 **userspace tunnel — geen sudo, geen LaunchDaemon**
-- Auto-reconnect met health monitoring — WiFi drops worden automatisch opgevangen
-- Touch control (tap, swipe, scroll, pinch) via WebDriverAgent met Bearer token auth
-- Home / Lock / Volume / Unlock (met opgeslagen passcode via macOS Keychain)
-- Toetsenbord naar iPhone (tekstvelden, arrow keys, Enter, etc.)
-- iPhone-vormig frameless venster met bezel + Dynamic Island
-- Device detectie: friendly name + juiste screen size per iPhone model
-- MJPEG stream met hardware JPEG encoding (~10 FPS met tunable kwaliteit)
+Tested against **iPhone 17 Pro Max on iOS 27** with **macOS 15+ (Sequoia)**. Any iPhone with iOS 17+ should work — older iOS versions won't because they lack the developer-mode RSD tunnel that this project depends on.
 
-## Prerequisites
+---
 
-- macOS 14+ (Sonoma of nieuwer)
-- iPhone met iOS 17+ en Developer Mode aan
-- Apple Developer account (voor WebDriverAgent signing)
-- Xcode (voor WebDriverAgent bouwen)
+## Why this exists
 
-## Installatie
+Apple shipped iPhone Mirroring in macOS Sequoia (2024) but disabled it across the European Union pending Digital Markets Act clarity. If you're in the EU with a personal iPhone, you cannot use Apple's version at all.
 
-### 1. Repo clonen
+This project stitches together a working equivalent from three existing open-source pieces:
+
+| Piece | What it does |
+|---|---|
+| [pymobiledevice3](https://github.com/doronz88/pymobiledevice3) (v9+) | Reverse-engineered device tunnel to the iPhone over WiFi — no jailbreak, no Apple binaries. |
+| [WebDriverAgent](https://github.com/appium/WebDriverAgent) (Appium fork) | On-device XCTest runner that exposes an HTTP API for taps, swipes and keys, plus an MJPEG screen stream. |
+| [PyQt6 + qasync](https://github.com/CabbageDevelopment/qasync) | Native macOS window that hosts the video stream and forwards mouse/keyboard events. |
+
+The friction is real: you need an **Apple Developer account** (free tier works) to sign WebDriverAgent yourself, because Apple's code-signing model doesn't allow us to ship a pre-signed binary that would run on your phone. See the setup section below — you'll go through it once per iPhone.
+
+---
+
+## What you'll need
+
+Before you start, make sure you have:
+
+- **Mac** running macOS 14+ (Sonoma) with **Xcode 16+** installed
+- **iPhone** running iOS 17+ (iOS 27 tested)
+- **Apple ID** signed into Xcode → **Settings → Accounts** — the free tier is enough for personal builds
+- **Homebrew** (the installer will offer to add it if missing)
+- Both devices on the **same WiFi network**
+
+You do **not** need:
+
+- A paid Apple Developer Program subscription (free-tier signing works)
+- A jailbroken iPhone
+- Any Apple binaries — this uses reverse-engineered protocols only
+
+---
+
+## Setup
+
+The setup has three parts. The first two you do **once**. The third — signing WebDriverAgent — needs to be redone every ~7 days if you're on the free Apple Developer tier (that's Apple's certificate expiry, not ours).
+
+### Part 1 — Prepare the Mac
 
 ```bash
-git clone https://github.com/<jouw-github>/iPhoneMirroring.git
-cd iPhoneMirroring
-```
-
-### 2. Automatische install
-
-```bash
+git clone https://github.com/YOUR-USERNAME/iphone-wifi-mirror.git
+cd iphone-wifi-mirror
 ./install.sh
 ```
 
-Dit script:
-- Installeert Homebrew (als niet aanwezig)
-- Installeert Python 3.14 via Homebrew
-- Maakt een virtual environment
-- Installeert Python dependencies
-- Maakt `run.sh` aan
+The installer will:
 
-### 3. iPhone pairen (éénmalig)
+- Install [Homebrew](https://brew.sh/) if it isn't already
+- Install Python 3.14 via Homebrew
+- Create a `.venv/` virtual environment
+- Install Python dependencies from `requirements.txt`
+- Create the `run.sh` launcher
+
+No admin password required.
+
+### Part 2 — Pair your iPhone
+
+Only needed once per iPhone. Enable Developer Mode first:
+
+**On the iPhone:**
+
+1. **Settings → Privacy & Security → Developer Mode → On** (requires a restart)
+2. Plug the iPhone into your Mac with a USB cable
+3. Accept the **"Trust this Computer?"** dialog when it appears
+
+**On the Mac:**
 
 ```bash
 sudo pymobiledevice3 remote pair
 ```
 
-Volg de instructies op je iPhone.
+Follow the prompt on your iPhone to confirm the pairing. When it's done, unplug the cable — you'll do everything over WiFi from here on.
 
-### 4. WebDriverAgent bouwen
+### Part 3 — Build & install WebDriverAgent
 
-WDA is nodig voor touch control. Je bouwt het met je eigen Apple Developer signing.
+This is the part that must be done with **your** Apple ID because iOS refuses to launch code signed by anyone else. Everyone who uses this project needs to do this step once.
+
+**Choose your own bundle ID.** It must be globally unique per Apple ID. A good pattern is `com.yourname.WebDriverAgentRunner` — for example `com.jdoe.WebDriverAgentRunner`. You'll need this exact string later in `WDA_BUNDLE_ID`.
+
+**Clone WebDriverAgent:**
 
 ```bash
 git clone https://github.com/appium/WebDriverAgent.git
 cd WebDriverAgent
+open WebDriverAgent.xcodeproj
 ```
 
-Open `WebDriverAgent.xcodeproj` in Xcode:
-1. Selecteer scheme `WebDriverAgentRunner`
-2. In Signing & Capabilities: kies je Team, verander Bundle Identifier naar iets uniek (bv. `com.jouwnaam.WebDriverAgentRunner`)
-3. Doe hetzelfde voor `IntegrationApp`
+**In Xcode:**
 
-Bouw en installeer op je device:
+1. In the sidebar, pick the **WebDriverAgent** project (blue icon at top)
+2. Select target **WebDriverAgentRunner** (or `WebDriverAgentRunner_tvOS` if you're on Apple TV — you probably aren't)
+3. Under **Signing & Capabilities**:
+   - ✅ Automatically manage signing
+   - **Team**: pick your personal Apple ID
+   - **Bundle Identifier**: change to your unique one (e.g. `com.jdoe.WebDriverAgentRunner`)
+4. Repeat for the **IntegrationApp** target (any unique bundle ID; won't be used at runtime but must be signable)
+
+**Build for your device:**
 
 ```bash
 xcodebuild build-for-testing \
   -project WebDriverAgent.xcodeproj \
   -scheme WebDriverAgentRunner \
   -destination generic/platform=iOS \
-  -derivedDataPath /tmp/wda-build
-
-pymobiledevice3 apps install \
-  /tmp/wda-build/Build/Products/Debug-iphoneos/WebDriverAgentRunner-Runner.app \
-  --tunnel <UDID>
+  -derivedDataPath /tmp/wda-build \
+  -allowProvisioningUpdates
 ```
 
-**Belangrijk:** onthoud je gekozen bundle ID en pas hem aan in [src/device_manager.py](src/device_manager.py) op `WDA_BUNDLE_ID`.
+**Install onto the iPhone:**
 
-### 5. App starten
+Find your iPhone's UDID first:
+
+```bash
+pymobiledevice3 usbmux list
+```
+
+Then install (works over WiFi if pairing succeeded in Part 2):
+
+```bash
+pymobiledevice3 apps install \
+  /tmp/wda-build/Build/Products/Debug-iphoneos/WebDriverAgentRunner-Runner.app \
+  --tunnel <YOUR-UDID>
+```
+
+**Trust the developer profile on the iPhone:**
+
+The first time you install a build signed by your Apple ID, iOS will refuse to launch it until you approve the developer profile:
+
+- **Settings → General → VPN & Device Management → your Apple ID → Trust**
+
+You only need to do this once per Apple ID per iPhone.
+
+### Part 4 — Point the app at your bundle ID
+
+The mirror app needs to know which bundle ID you chose in Part 3:
+
+```bash
+export WDA_BUNDLE_ID="com.jdoe.WebDriverAgentRunner.xctrunner"
+```
+
+Note the **`.xctrunner`** suffix — that's what Xcode adds to the WebDriverAgentRunner build. If you used `com.jdoe.WebDriverAgentRunner` as bundle ID in Xcode, the runtime bundle is `com.jdoe.WebDriverAgentRunner.xctrunner`.
+
+Add the export to your `~/.zshrc` (or shell rc file) so you don't have to do it every session.
+
+### Part 5 — Launch
 
 ```bash
 ./run.sh
 ```
 
-**Geen sudo, geen tunnel service, niks te installeren.** De app opent zijn eigen userspace tunnel in-process. Zodra je iPhone gevonden wordt via usbmux, verbindt hij automatisch en start MJPEG capture.
+Within ~10 seconds:
 
-Als de WiFi tunnel valt: health monitor detecteert het binnen ~6s en herverbindt automatisch met exponential backoff.
+- The frameless iPhone-shaped window appears
+- Discovery finds your iPhone via mDNS/usbmux
+- A userspace tunnel opens (no admin password needed)
+- WebDriverAgent launches on the iPhone via XCTest
+- Screen mirroring starts at ~9-10 FPS
 
-## Gebruik
+You're done.
 
-- **Home** (⌂ / Ctrl+H): iPhone home button
-- **Lock** (🔒 / Ctrl+L): scherm vergrendelen
-- **Unlock** (🔓 / Ctrl+U): scherm wekken + passcode invoeren
-- **Vol+/−**: volume
-- **↻**: herverbind met device
-- **⚙**: settings — passcode + device selectie
-- **Drag**: sleep het venster aan de bezel (positie wordt onthouden)
-- **Klik in scherm**: tap wordt doorgestuurd naar iPhone
-- **Scroll**: 2-vinger trackpad = swipe (met inertia)
-- **Cmd + Scroll**: pinch-to-zoom (Foto's, Maps, Safari)
-- **Toetsenbord**: type direct in iPhone tekstvelden
+---
 
-## Passcode voor Unlock
+## Using it
 
-Klik ⚙ → vul je 6-cijferige iPhone passcode in → Opslaan.
+| Action | How |
+|---|---|
+| **Tap** | Left-click on the screen |
+| **Swipe / drag** | Click and drag |
+| **Scroll** | Two-finger trackpad gesture inside the window |
+| **Pinch-to-zoom** | ⌘ + scroll (works in Photos, Maps, Safari) |
+| **Type** | Just type — text goes to whatever field is focused on the iPhone |
+| **Home** | ⌂ button in the app's bottom bar |
+| **Lock / Unlock** | 🔒 / 🔓 buttons (Unlock uses saved passcode) |
+| **Volume ± ** | +/− buttons |
+| **Reconnect** | ↻ button |
+| **Settings** | ⚙ button — passcode, device selection |
+| **Move window** | Drag by the outer bezel |
 
-Wordt bewaard in macOS Keychain per device UDID. Wordt gebruikt door de Unlock knop.
+### Saving your passcode
+
+Click **⚙ → passcode field → enter your 6-digit iPhone passcode → Save**. Stored in the macOS Keychain per iPhone UDID. The **Unlock** button will wake the phone and type the passcode automatically.
+
+### Custom scroll direction
+
+Two-finger scrolling is configured for reverse-vertical (Windows-style: trackpad down = content moves up), natural horizontal. If you want different behavior, edit `_flush_scroll` in `src/input_handler.py` — the two `finger_dx = …` and `finger_dy = …` lines are marked with a comment.
+
+### Tap alignment
+
+The app compensates for a known WebDriverAgent quirk on newer iPhones where taps drift progressively lower as `y` grows. The compensation is a `TAP_Y_SCALE` env var (default `0.95`). If tapping feels off on your model:
+
+```bash
+export TAP_Y_SCALE=0.93   # lower = taps land higher
+./run.sh
+```
+
+---
 
 ## Troubleshooting
 
-### iPhone niet gevonden
+### iPhone not found
 
-- Zit iPhone op dezelfde WiFi als je Mac?
-- Developer Mode aan? (Settings → Privacy & Security → Developer Mode)
-- iPhone gepaird? `pymobiledevice3 usbmux list`
-- **Bij herhaalde issues**: kabel er even in, "Vertrouw deze computer" popup accepteren, dan kabel eruit — WiFi discovery wordt daarmee gereset.
+- Same WiFi as the Mac? (Both connected to the same SSID, not one on 5 GHz and the other on 2.4 GHz on some meshy routers)
+- Developer Mode enabled on the phone?
+- Try `pymobiledevice3 usbmux list` — does the phone show up over USB?
+- **Nuclear reset**: plug in the USB cable, accept "Trust this Computer" again, unplug. This resets Apple's mDNS trust cache which iOS 17+ sometimes needs.
 
-### Tunnel drops steeds
+### Tunnel keeps dropping
 
-- Check log — je zou "Tunnel lost" / "Reconnecting" moeten zien
-- Als de auto-reconnect na 6 pogingen faalt: klik ↻ voor handmatig
-- iOS 27 WiFi kan flaky zijn — pymobiledevice3 v9.36+ heeft hier fixes voor
+- iOS 17+ WiFi tunnels are inherently flaky, especially after screen lock. The app auto-reconnects with exponential backoff (up to 6 attempts).
+- Persistent failure after screen lock: keep the phone unlocked while using, or set **Settings → Display & Brightness → Auto-Lock → Never**.
 
-### WDA connect faalt
+### WebDriverAgent connection fails
 
-- Check dat WDA app op de iPhone geïnstalleerd is
-- Bundle ID in `device_manager.py` moet matchen met wat je in Xcode hebt ingesteld
-- App start WDA via xcuitest bij eerste connect (dat kan 30s duren)
+- Bundle ID mismatch — verify `echo $WDA_BUNDLE_ID` matches what you used in Xcode (+ `.xctrunner`)
+- Certificate expired — free-tier Apple certs last 7 days. Rebuild + reinstall.
+- Runner not trusted — Settings → General → VPN & Device Management → Trust
 
-### FPS laag
+### Backspace types glyphs instead of deleting
 
-- Screen capture draait in subprocess om GIL-contention te vermijden
-- Verwachte FPS: 6-12 (afhankelijk van WiFi + Mac CPU)
-- Tune in [src/device_manager.py](src/device_manager.py) — de env vars `MJPEG_SERVER_SCREENSHOT_QUALITY`, `MJPEG_SCALING_FACTOR`, `MJPEG_SERVER_FRAMERATE`
-- Zie [FINDINGS.md](FINDINGS.md) voor details
+Older versions had a Unicode-Private-Use-Area bug where WebDriver key codes (``) rendered as ❌ glyphs. Fixed as of this release — control chars go directly (`\x08`, `\r`, `\x09`, etc.).
 
-## Verwijderen
+### Drawing lines are offset from the mouse
+
+Recent WDA builds route drags through `wda/dragfromtoforduration`, which has a linear y-drift on iPhone 17. This project routes drags through the W3C `/actions` endpoint instead — same coord semantics as `/wda/tap`, so lines land where you drag.
+
+### Low FPS
+
+MJPEG is I/O bound. If you're getting <5 FPS, check WiFi signal on both ends. Tune JPEG quality with the env vars in `src/device_manager.py`:
+
+```python
+"--env", "MJPEG_SERVER_SCREENSHOT_QUALITY=55"  # 1-100, default 55
+"--env", "MJPEG_SCALING_FACTOR=50"             # 1-100, default 50
+"--env", "MJPEG_SERVER_FRAMERATE=12"           # target FPS, default 12
+```
+
+---
+
+## What this project won't do
+
+Being honest about the limits:
+
+- **No 60 FPS mirroring.** MJPEG over WiFi tops out around 10-12 FPS. Apple's iPhone Mirroring uses a private low-latency streaming protocol that isn't accessible without their entitlements. If you need higher FPS, plug in a cable and use [quicktime_video_hack](https://github.com/danielpaulus/quicktime_video_hack) — 60 FPS HEVC over USB, but no touch control.
+- **No pixel-perfect pen drawing.** Every touch is one HTTP round-trip through WebDriverAgent (~50-100ms). Fine for taps and gestures; not suitable for signature-style drawing.
+- **No always-on background service.** The app is not a menu-bar utility; it opens a window and connects while the window is open.
+
+---
+
+## Architecture
+
+```
+main.py                     qasync bootstrap, PyQt event loop
+src/
+├── main_window.py          PyQt6 frameless iPhone-shaped UI
+├── device_manager.py       Async device discovery + WDA lifecycle
+├── tunnel_manager.py       Userspace RSD tunnel + health monitor + auto-reconnect
+├── tunnel_forwarder.py     TCP forwarder: localhost <-> RSD tunnel
+├── screen_capture.py       In-process async MJPEG reader
+├── input_handler.py        WebDriverAgent HTTP client (tap/swipe/keys)
+├── passcode_store.py       macOS Keychain wrapper for iPhone passcode
+├── wda_auth.py             WDA Bearer token generation + storage
+└── device_models.py        ProductType → friendly name + screen size
+```
+
+See [FINDINGS.md](FINDINGS.md) for the reverse-engineering notes and design decisions.
+
+---
+
+## Contributing
+
+Contributions welcome, especially:
+
+- **Additional iPhone model coverage** in `src/device_models.py` — I only have an iPhone 17 Pro Max to test with
+- **Alternative low-latency screen protocols** — if anyone in the pymobiledevice3 community reverse-engineers Apple's Valeria protocol, wiring that in would give real 60 FPS
+- **PyInstaller/py2app bundle** so users don't have to deal with the Python side at all
+- **CI** — running the test suite on GitHub Actions
+
+Please open an issue first for larger changes. Test suite: `pytest tests/`.
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+This project is not affiliated with Apple, Facebook, or Appium. WebDriverAgent is © Facebook under the BSD license; pymobiledevice3 is © doronz88 under GPLv3.
+
+---
+
+## Uninstall
 
 ```bash
 ./uninstall.sh
 ```
 
-Verwijdert de venv (en eventuele legacy v7 tunnel service). Geen sudo nodig tenzij v7 residu opgeruimd moet worden.
-
-## Architectuur
-
-- **main.py** — qasync bootstrap, PyQt event loop
-- **src/main_window.py** — PyQt6 UI met frameless iPhone-vorm
-- **src/tunnel_manager.py** — userspace tunnel + health monitor + auto-reconnect
-- **src/device_manager.py** — async device discovery + WDA lifecycle
-- **src/screen_capture.py** — MJPEG worker orchestration + DVT fallback
-- **src/mjpeg_capture_worker.py** — losstaand MJPEG stream reader
-- **src/capture_worker.py** — losstaand DVT screenshot proces (async, v9)
-- **src/input_handler.py** — WebDriverAgent HTTP client (touch/keys)
-- **src/passcode_store.py** — macOS Keychain wrapper voor passcode
-- **src/wda_auth.py** — WDA bearer token generatie/storage
-- **src/device_models.py** — ProductType → friendly name + screen size
-
-## Tests
-
-```bash
-source .venv/bin/activate
-pytest tests/
-```
-
-Unit tests dekken TunnelManager (health monitoring, reconnect, backoff) en DeviceManager (device selectie, signal emission). Draaien zonder iPhone — regressie preventie.
-
-## License
-
-MIT (zie LICENSE)
-
-## Roadmap
-
-- [x] Multi-device support (Settings → iPhone kiezen)
-- [x] Userspace tunnel (geen sudo, geen LaunchDaemon)
-- [x] Auto-reconnect met health monitoring
-- [x] Test suite voor regressie preventie
-- [ ] `.app` bundle met PyInstaller voor `/Applications`
-- [ ] Homebrew Cask voor eenvoudige install
-- [ ] Automatische WDA bouw via install script (met Apple Developer prompt)
-- [ ] Valeria protocol support (als community die reverse-engineered) voor 60 FPS hardware VNC
+Removes the venv. Doesn't touch your WebDriverAgent install on the phone — you can delete that via **Settings → General → VPN & Device Management → your Apple ID → Remove**.

@@ -144,8 +144,14 @@ class TunnelManager:
             self._udid = None
             return
         logger.info("Closing tunnel to %s", self._udid)
+        # Bound aclose so a stuck userspace tunnel (PyTCP FIN never
+        # acked, iOS peer already gone) can't hold shutdown open. 2s
+        # is enough: a healthy close finishes in <500ms; beyond that
+        # we're just waiting for a socket that is not coming back.
         try:
-            await self._tunnel.aclose()
+            await asyncio.wait_for(self._tunnel.aclose(), timeout=2.0)
+        except asyncio.TimeoutError:
+            logger.warning("Tunnel aclose timed out after 2s — abandoning")
         except Exception as e:
             logger.warning("Tunnel close raised: %s", e)
         finally:
@@ -235,9 +241,15 @@ class TunnelManager:
                 )
                 return
             except Exception as e:
+                # `%s` on some pymobiledevice3 errors renders as an empty
+                # string (their __str__ is blank), so the log line becomes
+                # "Reconnect attempt 3/6 failed:" with no signal. Include
+                # the type name and stack so a persistent failure is
+                # actually diagnosable.
                 logger.warning(
-                    "Reconnect attempt %d/%d failed: %s",
-                    attempt, MAX_RECONNECT_ATTEMPTS, e,
+                    "Reconnect attempt %d/%d failed: %s: %s",
+                    attempt, MAX_RECONNECT_ATTEMPTS, type(e).__name__, e or "<no message>",
+                    exc_info=e,
                 )
 
         await self._emit(
