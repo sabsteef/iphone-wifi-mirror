@@ -1,5 +1,5 @@
+import asyncio
 import logging
-import threading
 
 from datetime import datetime
 
@@ -35,8 +35,8 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from src import device_models, passcode_store, tunnel_manager, wda_auth
-from src.device_manager import ConnectionState, DeviceManager
+from src import device_models, passcode_store, wda_auth
+from src.device_manager import ConnectionState, DeviceManager, _log_task_exception
 from src.input_handler import InputHandler
 from src.screen_capture import ScreenCaptureThread
 
@@ -57,10 +57,12 @@ class ScreenView(QWidget):
         self._pixmap: QPixmap | None = None
         self._has_frame = False
         self._placeholder_text = (
-            "Searching for iPhone…\n\n"
-            "• Same WiFi network\n"
-            "• Developer Mode on\n"
-            "• pymobiledevice3 remote tunneld"
+            "Zoeken naar iPhone…\n\n"
+            "Als hij niet gevonden wordt:\n"
+            "• Zelfde WiFi als je Mac\n"
+            "• Developer Mode aan\n"
+            "• Gepaird via USB (eenmalig)\n"
+            "• iPhone even ontgrendelen"
         )
 
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -87,9 +89,15 @@ class ScreenView(QWidget):
                 Qt.AspectRatioMode.KeepAspectRatio,
                 Qt.TransformationMode.SmoothTransformation,
             )
-            x = (self.width() - scaled.width()) / 2
-            y = (self.height() - scaled.height()) / 2
-            painter.drawPixmap(int(x), int(y), scaled)
+            # Use int-truncated origin to match what drawPixmap uses,
+            # then hand the exact same numbers to the input handler so
+            # its coordinate translation cannot drift due to rounding.
+            x = int((self.width() - scaled.width()) / 2)
+            y = int((self.height() - scaled.height()) / 2)
+            painter.drawPixmap(x, y, scaled)
+            self._input_handler.set_display_geometry(
+                x, y, scaled.width(), scaled.height()
+            )
         else:
             painter.setPen(QColor("#888"))
             font = QFont()
@@ -117,6 +125,12 @@ class ScreenView(QWidget):
         self._has_frame = False
         self._pixmap = None
         self.update()
+
+    def set_placeholder(self, text: str) -> None:
+        """Update the message shown while no iPhone frame is available."""
+        self._placeholder_text = text
+        if not self._has_frame:
+            self.update()
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton and self._has_frame:
@@ -264,7 +278,6 @@ class SettingsDialog(QDialog):
 
         layout.addWidget(self._device_group())
         layout.addWidget(self._passcode_group())
-        layout.addWidget(self._service_group())
 
         close = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         close.rejected.connect(self.reject)
@@ -294,7 +307,7 @@ class SettingsDialog(QDialog):
         settings = QSettings("iPhoneMirroring", "iPhoneMirror")
         preferred = settings.value("device/preferred_udid", "", type=str)
 
-        available = self._device_manager.list_available_devices() if self._device_manager else []
+        available = getattr(self._device_manager, "_last_devices", []) if self._device_manager else []
         seen_udids = set()
         for d in available:
             udid = d.get("udid", "")
@@ -366,51 +379,6 @@ class SettingsDialog(QDialog):
 
         return group
 
-    def _service_group(self) -> QWidget:
-        group = QFrame()
-        group.setStyleSheet(
-            "QFrame { background: #1a1a1a; border-radius: 8px; padding: 8px; }"
-            "QLabel { color: #ccc; }"
-        )
-        layout = QVBoxLayout(group)
-
-        title = QLabel("Tunnel service")
-        title.setStyleSheet("font-weight: bold; font-size: 13px;")
-        layout.addWidget(title)
-
-        self._svc_status = QLabel()
-        self._svc_status.setStyleSheet("font-size: 11px; color: #888;")
-        layout.addWidget(self._svc_status)
-
-        row = QHBoxLayout()
-        self._btn_install = QPushButton("Installeren")
-        self._btn_install.clicked.connect(self._install)
-        self._btn_uninstall = QPushButton("Verwijderen")
-        self._btn_uninstall.clicked.connect(self._uninstall)
-        self._btn_start = QPushButton("Start")
-        self._btn_start.clicked.connect(self._start)
-        self._btn_stop = QPushButton("Stop")
-        self._btn_stop.clicked.connect(self._stop)
-        for b in (self._btn_install, self._btn_uninstall, self._btn_start, self._btn_stop):
-            row.addWidget(b)
-        layout.addLayout(row)
-
-        self._refresh_service_state()
-        return group
-
-    def _refresh_service_state(self):
-        installed = tunnel_manager.is_fully_installed()
-        running = tunnel_manager.is_tunneld_running()
-        parts = []
-        parts.append("Service: geïnstalleerd" if installed else "Service: niet geïnstalleerd")
-        parts.append("draait" if running else "gestopt")
-        self._svc_status.setText(" · ".join(parts))
-
-        self._btn_install.setEnabled(not installed)
-        self._btn_uninstall.setEnabled(installed)
-        self._btn_start.setEnabled(installed and not running)
-        self._btn_stop.setEnabled(installed and running)
-
     def _save_passcode(self):
         code = self._pc_input.text().strip()
         if code and not code.isdigit():
@@ -420,36 +388,6 @@ class SettingsDialog(QDialog):
             QMessageBox.information(self, "Opgeslagen", "Passcode opgeslagen in Keychain.")
         else:
             QMessageBox.warning(self, "Fout", "Kon passcode niet opslaan.")
-
-    def _install(self):
-        ok, err = tunnel_manager.install_service()
-        if not ok:
-            QMessageBox.warning(self, "Installatie mislukt", err)
-        self._refresh_service_state()
-
-    def _uninstall(self):
-        reply = QMessageBox.question(
-            self, "Verwijderen",
-            "Service en sudoers regel verwijderen?",
-        )
-        if reply != QMessageBox.StandardButton.Yes:
-            return
-        ok, err = tunnel_manager.uninstall_service()
-        if not ok:
-            QMessageBox.warning(self, "Verwijderen mislukt", err)
-        self._refresh_service_state()
-
-    def _start(self):
-        ok, err = tunnel_manager.start_service()
-        if not ok:
-            QMessageBox.warning(self, "Start mislukt", err)
-        self._refresh_service_state()
-
-    def _stop(self):
-        ok, err = tunnel_manager.stop_service()
-        if not ok:
-            QMessageBox.warning(self, "Stop mislukt", err)
-        self._refresh_service_state()
 
 
 class MainWindow(QMainWindow):
@@ -470,6 +408,11 @@ class MainWindow(QMainWindow):
         if preferred:
             self.device_manager.set_preferred_udid(preferred)
         self.input_handler = InputHandler(self)
+        # When device_manager is about to kill the xcuitest subprocess,
+        # give the WDAClient a chance to POST /wda/shutdown so the
+        # runner app on the iPhone terminates itself instead of leaking
+        # until iOS's XCTest heartbeat times out.
+        self.device_manager._on_pre_stop_wda = self.input_handler.wda.disconnect
         self.capture_thread = None
         self._connected = False
 
@@ -482,62 +425,135 @@ class MainWindow(QMainWindow):
         self._wda_retry_timer = QTimer(self)
         self._wda_retry_timer.timeout.connect(self._try_wda)
         self._wda_retry_timer.setInterval(5000)
+        # Cap WDA retry attempts so a permanently broken WDA install
+        # (missing bundle id, expired provisioning profile, unpaired
+        # device) doesn't spam the log and executor forever. Reset on
+        # every connect success in _on_wda_status.
+        self._wda_retry_attempt = 0
+        self._wda_retry_max = 24  # 24 × 5s = ~2 minutes of retries
 
         self._keepalive_timer = QTimer(self)
         self._keepalive_timer.timeout.connect(self._keep_alive)
         self._keepalive_timer.setInterval(25000)
 
-        QTimer.singleShot(200, self._ensure_tunnel_and_discover)
+    async def start_async(self) -> None:
+        """Called after the qasync loop is running. Starts device discovery."""
+        self._status_label.setText("Zoeken naar iPhone…")
+        # DeviceManager owns the userspace tunnel — no external service needed.
+        self.device_manager.start_discovery()
+        # Poll available devices for the settings picker every few seconds.
+        self._devices_refresh_task = asyncio.ensure_future(self._refresh_devices_loop())
 
-    def _ensure_tunnel_and_discover(self):
-        self._started_tunnel = False
-        if tunnel_manager.is_tunneld_running():
-            self._status_label.setText("Tunnel actief")
-            self.device_manager.start_discovery()
-            return
+    async def _refresh_devices_loop(self) -> None:
+        try:
+            while True:
+                try:
+                    devices = await self.device_manager.list_available_devices()
+                    self.device_manager._last_devices = devices
+                    # If not connected yet, keep the placeholder informative.
+                    if not self._connected:
+                        bonjour_hosts = []
+                        if not devices:
+                            # Fall back to bonjour to detect iPhones out of
+                            # usbmux reach (trust popup not accepted etc.).
+                            bonjour_hosts = await self.device_manager.bonjour_visible_hosts()
+                        self._update_search_placeholder(devices, bonjour_hosts)
+                except Exception as e:
+                    logger.debug("Device refresh failed: %s", e)
+                await asyncio.sleep(3.0)
+        except asyncio.CancelledError:
+            pass
 
-        if tunnel_manager.is_fully_installed():
-            self._status_label.setText("Tunnel starten…")
-            ok, err = tunnel_manager.start_service()
-            if ok:
-                self._started_tunnel = True
-                self._status_label.setText("Tunnel actief")
-                self.device_manager.start_discovery()
-            else:
-                self._status_label.setText("Tunnel start faalde")
-                QMessageBox.warning(
-                    self, "Tunnel start mislukt",
-                    f"{err}\n\nCheck /var/log/iphonemirror-tunneld.log",
-                )
-            return
-
-        reply = QMessageBox.question(
-            self, "Tunnel service",
-            "Installeer de tunnel service?\n\n"
-            "De service start/stopt automatisch met de app.\n"
-            "macOS vraagt éénmalig je admin wachtwoord.\n"
-            "Daarna nooit meer prompts.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+    def _update_search_placeholder(
+        self, devices: list[dict], bonjour_hosts: list[str] | None = None,
+    ) -> None:
+        preferred = QSettings("iPhoneMirroring", "iPhoneMirror").value(
+            "device/preferred_udid", "", type=str
         )
-        if reply != QMessageBox.StandardButton.Yes:
-            self._status_label.setText("Geen tunnel")
+        if not devices:
+            if bonjour_hosts:
+                host_list = "\n".join(f"  • {h}" for h in bonjour_hosts[:3])
+                self.screen_view.set_placeholder(
+                    "iPhone in bereik maar niet gepaird\n\n"
+                    f"Bonjour ziet:\n{host_list}\n\n"
+                    "Fix: kabel er even in, accepteer\n"
+                    "'Vertrouw deze computer' popup."
+                )
+                self._status_label.setText(
+                    f"{len(bonjour_hosts)} iPhone(s) zichtbaar, niet gepaird"
+                )
+            else:
+                self.screen_view.set_placeholder(
+                    "Zoeken naar iPhone…\n\n"
+                    "Geen device gevonden.\n\n"
+                    "Als hij niet verschijnt:\n"
+                    "• Zelfde WiFi als je Mac\n"
+                    "• Developer Mode aan\n"
+                    "• Kabel er even in (Trust popup)"
+                )
+                self._status_label.setText("Geen iPhone gevonden")
             return
-
-        self._status_label.setText("Tunnel installeren…")
-        ok, err = tunnel_manager.install_service()
-        if not ok:
-            QMessageBox.warning(self, "Installatie mislukt", err)
-            self._status_label.setText("Geen tunnel")
+        if preferred and not any(d["udid"] == preferred for d in devices):
+            names = ", ".join(d.get("name", "iPhone") for d in devices)
+            self.screen_view.set_placeholder(
+                "Voorkeurs-iPhone offline\n\n"
+                f"Gevonden: {names}\n"
+                "Kies ⚙ → iPhone kiezen"
+            )
+            self._status_label.setText(f"{len(devices)} device(s), voorkeur offline")
             return
+        # We have a matching device — tunnel is still opening.
+        self.screen_view.set_placeholder("Tunnel opzetten…")
+        self._status_label.setText("Tunnel opzetten…")
 
-        ok, err = tunnel_manager.start_service()
-        if ok:
-            self._started_tunnel = True
-            self._status_label.setText("Tunnel actief")
-            self.device_manager.start_discovery()
-        else:
-            QMessageBox.warning(self, "Tunnel start mislukt", err)
-            self._status_label.setText("Tunnel geïnstalleerd, niet gestart")
+    async def async_close(self) -> None:
+        """Async teardown called from the signal handler / close event.
+
+        Every step is time-bounded so a stuck subsystem can't hang the
+        whole shutdown — an unresponsive tunnel/WDA/subprocess must not
+        leave the process alive forever (which is what happened in an
+        earlier test run where the app ignored SIGTERM entirely).
+        """
+        settings = QSettings("iPhoneMirroring", "iPhoneMirror")
+        settings.setValue("window/pos", self.pos())
+        self._stop_capture()
+        # WDA HTTP DELETE session can block if the forwarder is already
+        # tearing down — run in an executor with a hard timeout.
+        try:
+            loop = asyncio.get_event_loop()
+            await asyncio.wait_for(
+                loop.run_in_executor(None, self.input_handler.cleanup),
+                timeout=3.0,
+            )
+        except (asyncio.TimeoutError, Exception) as e:
+            logger.warning("input_handler.cleanup timed out or raised: %s", e)
+        task = getattr(self, "_devices_refresh_task", None)
+        if task is not None and not task.done():
+            task.cancel()
+        # If a WDA subprocess spawn is still in flight (executor future
+        # scheduled but Popen not yet returned), wait briefly for it so
+        # device_manager.cleanup() actually sees the process and kills
+        # it, instead of letting the xcuitest runner orphan on-device.
+        wda_future = getattr(self, "_wda_start_future", None)
+        if wda_future is not None and not wda_future.done():
+            try:
+                await asyncio.wait_for(asyncio.wrap_future(wda_future), timeout=6.0)
+            except asyncio.TimeoutError:
+                logger.warning("WDA start future did not finish before shutdown")
+            except Exception as e:
+                logger.debug("WDA start future raised on shutdown: %s", e)
+        try:
+            await asyncio.wait_for(self.device_manager.cleanup(), timeout=8.0)
+        except asyncio.TimeoutError:
+            logger.warning("device_manager.cleanup did not finish in 8s")
+        except Exception as e:
+            logger.warning("device_manager.cleanup: %s", e)
+        # Belt-and-braces: stop the Qt loop explicitly so any remaining
+        # timer/callback can't keep it alive past shutdown.
+        try:
+            asyncio.get_event_loop().stop()
+        except Exception:
+            pass
 
     def _setup_ui(self):
         central = QWidget()
@@ -719,7 +735,35 @@ class MainWindow(QMainWindow):
         self.device_manager.device_disconnected.connect(self._on_device_disconnected)
         self.device_manager.connection_error.connect(self._on_connection_error)
         self.device_manager.connection_state_changed.connect(self._on_state_changed)
+        self.device_manager.tunnel_status_changed.connect(self._on_tunnel_status)
         self.input_handler.wda_status_changed.connect(self._on_wda_status)
+
+    def _on_tunnel_status(self, status: str, reason: str) -> None:
+        if status == "lost":
+            self._status_label.setText(f"Tunnel weg — reconnect… ({reason[:30]})")
+            self.screen_view.set_placeholder(
+                "Verbinding verloren\n\n"
+                "Automatisch aan het reconnecten…\n\n"
+                f"Reden: {reason[:60]}"
+            )
+            self.screen_view.show_disconnected()
+            self._stop_capture()
+            self._wda_retry_timer.stop()
+            self._keepalive_timer.stop()
+        elif status == "reconnecting":
+            self._status_label.setText(f"Reconnect… ({reason[:40]})")
+            self.screen_view.set_placeholder(f"Reconnecten…\n\n{reason}")
+        elif status == "reconnected":
+            self._status_label.setText("Reconnected — capture herstart")
+            self._start_capture()
+            self._start_wda_auto()
+        elif status == "failed":
+            self._status_label.setText("Reconnect mislukt — check iPhone/WiFi")
+            self.screen_view.set_placeholder(
+                "Reconnect mislukt\n\n"
+                "Klik ↻ voor handmatige retry, of\n"
+                "steek de kabel er even in."
+            )
 
     def _on_device_connected(self, info: dict):
         if self._connected:
@@ -760,9 +804,23 @@ class MainWindow(QMainWindow):
 
         self.screen_view.show_disconnected()
 
+        # Restart discovery so a device switch (via Settings) or a fresh
+        # boot of the iPhone is picked up automatically.
+        try:
+            self.device_manager.start_discovery()
+        except Exception as e:
+            logger.debug("Discovery restart after disconnect failed: %s", e)
+
     def _on_connection_error(self, msg: str):
-        self._status_label.setText("Error")
-        QMessageBox.warning(self, "Connection Error", msg)
+        # Discovery retries every 2s. If we popped a modal for each emission,
+        # the user would get an inescapable "click OK" loop and could not
+        # even open Settings to pick a different device. Show it inline in
+        # the status label; only log the first repeated message at WARNING.
+        truncated = (msg[:80] + "…") if len(msg) > 80 else msg
+        self._status_label.setText(f"Error: {truncated}")
+        if getattr(self, "_last_conn_error_msg", None) != msg:
+            logger.warning("Connection error: %s", msg)
+            self._last_conn_error_msg = msg
 
     def _on_state_changed(self, state: ConnectionState):
         labels = {
@@ -793,59 +851,93 @@ class MainWindow(QMainWindow):
 
     def _on_fps(self, fps: float):
         self._fps_label.setText(f"{fps:.0f} FPS")
+        logger.debug("FPS %.1f", fps)
 
     def _on_capture_error(self, msg: str):
         logger.warning("Capture error: %s", msg)
         self._status_label.setText(f"Error: {msg[:50]}")
+        # If MJPEG couldn't reach WDA the xcuitest subprocess is likely
+        # still running (its HTTP side may or may not be up). Stop it so
+        # the next connect starts clean instead of racing an orphan.
+        if "MJPEG" in msg and self.device_manager.is_wda_running():
+            logger.info("Stopping orphan WDA subprocess after MJPEG give-up")
+            self.device_manager.stop_wda()
 
     def _start_wda_auto(self):
-        def _setup():
-            token = wda_auth.get_or_create_token()
-            self.input_handler.wda.set_auth_token(token)
-            wda_url = self.device_manager.get_wda_url()
-            self.input_handler.wda.base_url = wda_url.rstrip("/")
-            logger.info("WDA URL: %s", wda_url)
-            self.device_manager.start_wda(auth_token=token)
-
-        threading.Thread(target=_setup, daemon=True).start()
+        token = wda_auth.get_or_create_token()
+        self.input_handler.wda.set_auth_token(token)
+        wda_url = self.device_manager.get_wda_url()
+        self.input_handler.wda.base_url = wda_url.rstrip("/")
+        logger.info("WDA URL: %s", wda_url)
+        # start_wda is a subprocess spawn (blocking ~5s while it waits for
+        # xcuitest to come up). Run it in an executor to keep the UI responsive.
+        loop = asyncio.get_event_loop()
+        # Track the future so shutdown can wait for it (or at least know
+        # it exists) instead of racing stop_wda against a not-yet-spawned
+        # subprocess.
+        self._wda_start_future = loop.run_in_executor(
+            None, self.device_manager.start_wda, token,
+        )
+        # Fresh connect → fresh retry budget.
+        self._wda_retry_attempt = 0
         self._wda_retry_timer.start()
 
     def _try_wda(self):
         if self.input_handler.wda.is_connected:
+            self._wda_retry_attempt = 0
+            return
+        self._wda_retry_attempt += 1
+        if self._wda_retry_attempt > self._wda_retry_max:
+            logger.warning(
+                "WDA still unreachable after %d attempts — stopping retry timer. "
+                "Reconnect on the next tunnel/device event.",
+                self._wda_retry_attempt - 1,
+            )
+            self._wda_retry_timer.stop()
+            self._status_label.setText("WDA niet bereikbaar — check iPhone")
             return
         token = wda_auth.get_or_create_token()
         self.input_handler.wda.set_auth_token(token)
         wda_url = self.device_manager.get_wda_url()
         self.input_handler.wda.base_url = wda_url.rstrip("/")
-        self.input_handler.try_connect_wda()
+        # WDAClient.connect makes 3 sync HTTP calls (~12s worst case). On the
+        # qasync loop that blocks paint/input and every other async task
+        # (health probe, discovery, reconnect). Push to executor.
+        loop = asyncio.get_event_loop()
+        loop.run_in_executor(None, self.input_handler.try_connect_wda)
 
     def _on_wda_status(self, connected: bool):
         self._wda_banner.setVisible(not connected)
         if connected:
+            self._wda_retry_attempt = 0
             logger.info("WDA connected — touch control enabled")
 
     def _keep_alive(self):
         pass
 
     def _update_battery(self):
-        try:
-            if self.input_handler.wda.is_connected:
-                info = self.input_handler.wda.get_battery_info()
-                if info and info.get("level", -1) >= 0:
-                    level = info["level"]
-                    state = info.get("state", 0)
-                    charging = " +" if state == 2 else ""
-                    self._battery_label.setText(f"🔋 {level}%{charging}")
-                    return
+        if not self.input_handler.wda.is_connected:
+            return
+        # Run the sync HTTP call in a thread so slow WDA doesn't lock the UI.
+        loop = asyncio.get_event_loop()
+        future = loop.run_in_executor(None, self.input_handler.wda.get_battery_info)
+        future.add_done_callback(self._on_battery_info)
 
-            if self.device_manager.is_connected:
-                info = self.device_manager.get_battery_info()
-                level = info.get("level", -1)
-                if level >= 0:
-                    charging = " +" if info.get("charging", False) else ""
-                    self._battery_label.setText(f"🔋 {level}%{charging}")
+    def _on_battery_info(self, future) -> None:
+        try:
+            info = future.result()
         except Exception as e:
-            logger.debug("Battery update failed: %s", e)
+            logger.debug("Battery poll failed: %s", e)
+            return
+        if not info or info.get("level", -1) < 0:
+            return
+        level = info["level"]
+        state = info.get("state", 0)
+        charging = " +" if state == 2 else ""
+        # Signal-safe: setText from any thread works because we're on the
+        # qasync loop thread when the callback fires (executor completion is
+        # scheduled on the loop).
+        self._battery_label.setText(f"🔋 {level}%{charging}")
 
     def _on_home(self):
         self.input_handler.go_home()
@@ -865,16 +957,40 @@ class MainWindow(QMainWindow):
 
     def _on_reconnect(self):
         self._on_device_disconnected()
-        self.device_manager.disconnect()
+        task = asyncio.ensure_future(self._async_reconnect())
+        task.add_done_callback(_log_task_exception("manual reconnect"))
+
+    async def _async_reconnect(self) -> None:
+        await self.device_manager.disconnect()
         self.device_manager.start_discovery()
 
     def closeEvent(self, event):
-        settings = QSettings("iPhoneMirroring", "iPhoneMirror")
-        settings.setValue("window/pos", self.pos())
-        self._stop_capture()
-        self.input_handler.cleanup()
-        self.device_manager.cleanup()
-        if getattr(self, "_started_tunnel", False):
-            logger.info("Stopping tunnel service (started by app)")
-            tunnel_manager.stop_service()
+        # Red-cross close would otherwise accept the event immediately,
+        # tearing down the Qt window and stopping the qasync loop before
+        # async_close finishes — which leaves the WDA runner alive on
+        # the iPhone (CLAUDE.md documents the v7 fix but it stopped
+        # working after v9's in-process userspace tunnel: the tunnel
+        # dies with the loop before killpg fires). Fix: ignore the
+        # first close event, run async_close to completion, then
+        # actually quit.
+        if getattr(self, "_closing", False):
+            super().closeEvent(event)
+            return
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                self._closing = True
+                event.ignore()
+
+                async def _finish():
+                    try:
+                        await self.async_close()
+                    finally:
+                        QApplication.instance().quit()
+
+                task = asyncio.ensure_future(_finish())
+                task.add_done_callback(_log_task_exception("close-event async teardown"))
+                return
+        except RuntimeError:
+            pass
         super().closeEvent(event)

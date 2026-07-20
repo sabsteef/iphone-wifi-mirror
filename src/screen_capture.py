@@ -1,254 +1,314 @@
-import logging
-import re
-import struct
-import subprocess
-import sys
-import time
+"""In-process async MJPEG capture over the v9 userspace tunnel.
 
-from PyQt6.QtCore import QThread, pyqtSignal
+Design notes:
+
+v9's :class:`pymobiledevice3.remote.userspace_tunnel.UserspaceRsdTunnel`
+runs a pure-Python TCP/IP stack **inside the current process**. Its RSD
+IPv6 address is reachable **only from that same process** — and only via
+the tunnel's own dialer. A plain ``asyncio.open_connection(host, port)``
+goes through the OS socket layer, which has no route to the userspace
+stack and returns ``[Errno 65] No route to host``.
+
+To reach the MJPEG server on port 9100 we ask the RSD to open the socket
+for us: :meth:`RemoteServiceDiscoveryService.create_service_connection`
+routes through the userspace dialer and hands back a
+:class:`ServiceConnection` whose :attr:`reader` / :attr:`writer` are
+plain ``asyncio`` stream objects — usable with ``readuntil`` /
+``readexactly`` for MJPEG boundary parsing.
+
+MJPEG is I/O-bound. Reader/writer do not hold the GIL while waiting on
+the socket, so the Qt UI paints freely between frames; JPEG decoding
+happens in Qt's C++ side via ``QImage.loadFromData``, which also
+releases the GIL for the decode step.
+
+This module exposes a Qt-friendly object that emits :attr:`frame_ready`
+and :attr:`fps_updated` signals from an asyncio task on the qasync loop.
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from typing import Optional
+
+from PyQt6.QtCore import QObject, pyqtSignal
 from PyQt6.QtGui import QImage
 
 logger = logging.getLogger(__name__)
 
+BOUNDARY = b"--BoundaryString"
+READ_BUFFER = 65536
+MAX_FRAME_BYTES = 50_000_000
+CONNECT_RETRY_DELAY_S = 1.0
+CONNECT_MAX_ATTEMPTS = 90
+FIRST_DATA_TIMEOUT_S = 8.0
+# Longest we'll wait for the next chunk of an already-flowing MJPEG stream
+# before treating the socket as stalled. Well above the 12 FPS server
+# tick but small enough to recover quickly when iOS pauses (e.g. lock
+# screen, WiFi hiccup).
+STREAM_READ_TIMEOUT_S = 6.0
 
-class ScreenCaptureThread(QThread):
+
+class ScreenCaptureThread(QObject):
+    """Compatibility name — used to be a QThread, now an asyncio task owner.
+
+    The public surface (`frame_ready`, `fps_updated`, `capture_error`,
+    `start`, `stop`, `pause`, `resume`) is preserved so main_window.py
+    doesn't need changes.
+    """
+
     frame_ready = pyqtSignal(QImage)
     fps_updated = pyqtSignal(float)
     capture_error = pyqtSignal(str)
 
     MJPEG_PORT = 9100
-    WORKER_READY_TIMEOUT = 30
 
-    def __init__(self, device_manager, target_fps: int = 30):
-        super().__init__()
+    def __init__(self, device_manager, target_fps: int = 30, parent: Optional[QObject] = None):
+        super().__init__(parent)
         self._device_manager = device_manager
-        self._running = False
         self._target_fps = target_fps
         self._paused = False
-        self._worker: subprocess.Popen | None = None
-        self._mode = "mjpeg"
+        self._running = False
+        self._task: Optional[asyncio.Task] = None
 
-    def pause(self):
+    # ─────────────────────────── public controls ─────────────────────────────
+
+    def pause(self) -> None:
         self._paused = True
 
-    def resume(self):
+    def resume(self) -> None:
         self._paused = False
 
-    def run(self):
+    def start(self) -> None:
+        """Kick off the async capture task on the running qasync loop."""
+        if self._task and not self._task.done():
+            return
         self._running = True
-        logger.info("Screen capture started")
+        self._task = asyncio.ensure_future(self._run())
+        self._task.add_done_callback(self._on_task_done)
 
-        udid = self._device_manager._current_udid
-        host = self._extract_host()
-        if host and self._run_mjpeg(host, self.MJPEG_PORT):
-            pass
-        elif udid and udid != "tunnel" and self._run_dvt_subprocess(udid):
-            pass
-        else:
-            self._run_dvt_inline()
+    # QThread parity — old code called .isRunning() / .stop() / .wait()
+    def isRunning(self) -> bool:
+        return self._running and self._task is not None and not self._task.done()
 
-        logger.info("Screen capture stopped")
+    def stop(self) -> None:
+        self._running = False
+        task = self._task
+        if task is None or task.done():
+            return
+        task.cancel()
 
-    def _extract_host(self) -> str | None:
-        url = self._device_manager.get_wda_url()
-        m = re.match(r"http://\[([^\]]+)\]:", url)
-        if m:
-            return m.group(1)
-        m = re.match(r"http://([^:]+):", url)
-        if m:
-            return m.group(1)
+    def wait(self, ms: int = 5000) -> None:
+        """QThread parity no-op: callers already ran ``stop()``.
+
+        The event-loop-based teardown drains via cancellation; there's
+        nothing meaningful to block on from a Qt slot without stalling
+        the loop that would run the cleanup.
+        """
         return None
 
-    def _start_worker(self, module: str, *args) -> subprocess.Popen | None:
-        cmd = [sys.executable, "-m", module, *args]
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                bufsize=0,
-                start_new_session=True,
-            )
-            ready_line = proc.stdout.readline()
-            if ready_line.strip() == b"READY":
-                logger.info("%s started (PID %d)", module, proc.pid)
-                return proc
+    # ─────────────────────────── internal ────────────────────────────────────
 
-            stderr_out = b""
+    def _on_task_done(self, task: asyncio.Task) -> None:
+        if task.cancelled():
+            logger.info("Screen capture cancelled")
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error("Screen capture task crashed: %s", exc, exc_info=exc)
+            self.capture_error.emit(str(exc))
+
+    async def _run(self) -> None:
+        """Outer supervisor: (re)connect, stream, and re-open on drop.
+
+        Streams die naturally when the WDA testrunner restarts (which
+        happens whenever we (re)spawn the xcuitest subprocess). Rather
+        than surface that as a fatal capture_error, retry a fresh
+        connect right after — the WDA HTTP + MJPEG servers come back a
+        few seconds after the runner's next testCaseDidStart.
+        """
+        logger.info("Screen capture started (in-process, async)")
+        while self._running:
+            rsd = self._device_manager.rsd
+            if rsd is None:
+                logger.info("Waiting for RSD tunnel before MJPEG connect")
+                await asyncio.sleep(1.0)
+                continue
+
+            conn = await self._connect_mjpeg(rsd)
+            if conn is None:
+                # Gave up after CONNECT_MAX_ATTEMPTS — surface a real error
+                last = getattr(self, "_last_connect_error", None)
+                detail = f" (last: {last})" if last else ""
+                self.capture_error.emit(
+                    f"MJPEG server niet bereikbaar — WDA niet gestart?{detail}"
+                )
+                return
+
             try:
-                proc.wait(timeout=3)
-                stderr_out = proc.stderr.read()
-            except Exception:
-                pass
-            logger.warning(
-                "%s failed (handshake=%r):\n%s",
-                module,
-                ready_line,
-                stderr_out.decode(errors="replace")[-2000:],
-            )
-            proc.kill()
-            return None
-        except Exception as e:
-            logger.warning("Failed to start %s: %s", module, e)
-            return None
+                await self._stream(conn.reader, conn.writer)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning("MJPEG stream error: %s — reconnecting", e)
+            finally:
+                try:
+                    await conn.aclose()
+                except Exception:
+                    pass
 
-    def _read_frame(self, proc: subprocess.Popen) -> bytes | None:
-        header = b""
-        while len(header) < 4:
-            chunk = proc.stdout.read(4 - len(header))
-            if not chunk:
+            if not self._running:
+                return
+            # Small backoff so the WDA testrunner respawn (if any) has
+            # a moment to bring HTTP + MJPEG back up.
+            logger.info("MJPEG stream dropped; reconnecting in %.1fs", CONNECT_RETRY_DELAY_S)
+            await asyncio.sleep(CONNECT_RETRY_DELAY_S)
+
+    async def _connect_mjpeg(self, rsd):
+        """Loop until we get an MJPEG socket that actually delivers data.
+
+        The userspace tunnel will happily hand back a "connected" socket
+        even when nothing on the device is bound to the port yet — the
+        actual failure only shows up as the read never producing bytes.
+        So each attempt sends the HTTP GET and waits for a real header
+        response; a timeout means "not ready yet, try again."
+        """
+        self._last_connect_error: Optional[str] = None
+        for attempt in range(1, CONNECT_MAX_ATTEMPTS + 1):
+            if not self._running:
                 return None
-            header += chunk
+            candidate = None
+            try:
+                candidate = await asyncio.wait_for(
+                    rsd.create_service_connection(self.MJPEG_PORT),
+                    timeout=5.0,
+                )
+                await candidate.start()  # populate .reader / .writer
+                candidate.writer.write(b"GET / HTTP/1.0\r\n\r\n")
+                await candidate.writer.drain()
+                headers = await asyncio.wait_for(
+                    candidate.reader.readuntil(b"\r\n\r\n"),
+                    timeout=FIRST_DATA_TIMEOUT_S,
+                )
+                logger.info(
+                    "MJPEG connected on attempt %d (HTTP headers %d bytes)",
+                    attempt, len(headers),
+                )
+                return candidate
+            except asyncio.TimeoutError:
+                self._last_connect_error = f"timeout after {FIRST_DATA_TIMEOUT_S:.0f}s (WDA MJPEG not accepting or not streaming)"
+                logger.debug(
+                    "MJPEG attempt %d/%d: %s",
+                    attempt, CONNECT_MAX_ATTEMPTS, self._last_connect_error,
+                )
+            except (OSError, ConnectionError, asyncio.IncompleteReadError) as e:
+                self._last_connect_error = f"{type(e).__name__}: {e}"
+                logger.debug(
+                    "MJPEG attempt %d/%d failed: %s",
+                    attempt, CONNECT_MAX_ATTEMPTS, self._last_connect_error,
+                )
+            except Exception as e:
+                self._last_connect_error = f"{type(e).__name__}: {e}"
+                logger.debug(
+                    "MJPEG attempt %d/%d raised %s",
+                    attempt, CONNECT_MAX_ATTEMPTS, self._last_connect_error,
+                )
+            if candidate is not None:
+                try:
+                    await candidate.aclose()
+                except Exception:
+                    pass
+            await asyncio.sleep(CONNECT_RETRY_DELAY_S)
+        logger.error(
+            "MJPEG connect gave up after %d attempts; last error: %s",
+            CONNECT_MAX_ATTEMPTS, self._last_connect_error or "<none captured>",
+        )
+        return None
 
-        length = struct.unpack(">I", header)[0]
-        if length > 50_000_000:
-            return None
-
-        data = b""
-        while len(data) < length:
-            chunk = proc.stdout.read(length - len(data))
-            if not chunk:
-                return None
-            data += chunk
-        return data
-
-    def _stream_from_worker(self) -> bool:
+    async def _stream(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        # HTTP GET + response headers were consumed by the connect loop.
         frame_count = 0
         fps_timer = time.time()
         smoothed_fps = 0.0
         alpha = 0.35
+        total_frames_since_start = 0
 
         while self._running:
             if self._paused:
-                time.sleep(0.1)
+                await asyncio.sleep(0.1)
                 continue
 
-            if self._worker.poll() is not None:
-                return False
+            # Advance to next multipart boundary. Bound every read so a
+            # server that goes silent (WDA hang, iOS locked, WiFi drop)
+            # doesn't leave the capture task blocked forever with no
+            # visible signal — TimeoutError propagates out of _stream and
+            # the supervisor reconnects.
+            try:
+                await asyncio.wait_for(reader.readuntil(BOUNDARY), timeout=STREAM_READ_TIMEOUT_S)
+            except asyncio.IncompleteReadError as e:
+                logger.warning(
+                    "MJPEG stream ended (server closed) after %d frames; partial=%d bytes",
+                    total_frames_since_start, len(e.partial) if e.partial else 0,
+                )
+                return
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "MJPEG stream stalled (no data in %.1fs) after %d frames",
+                    STREAM_READ_TIMEOUT_S, total_frames_since_start,
+                )
+                return
 
-            data = self._read_frame(self._worker)
-            if data is None:
-                return False
+            # Optional trailing \r\n after the boundary
+            peek = await asyncio.wait_for(reader.readexactly(2), timeout=STREAM_READ_TIMEOUT_S)
+            if peek != b"\r\n":
+                # not the expected separator; feed back? readuntil already
+                # consumed BOUNDARY so we can't put bytes back, but part
+                # headers always start with a name — fall through and let
+                # the header parse below re-sync on \r\n\r\n.
+                # Prepend what we grabbed by reading into a buffer.
+                header_start = peek
+            else:
+                header_start = b""
+
+            headers_bytes = header_start + await asyncio.wait_for(
+                reader.readuntil(b"\r\n\r\n"), timeout=STREAM_READ_TIMEOUT_S,
+            )
+
+            # Parse Content-Length
+            content_length = None
+            for line in headers_bytes.split(b"\r\n"):
+                if line.lower().startswith(b"content-length:"):
+                    try:
+                        content_length = int(line.split(b":", 1)[1].strip())
+                    except ValueError:
+                        pass
+                    break
+            if content_length is None or content_length <= 0 or content_length > MAX_FRAME_BYTES:
+                logger.warning("Missing/invalid Content-Length in MJPEG part; resyncing")
+                continue
+
+            jpeg = await asyncio.wait_for(
+                reader.readexactly(content_length), timeout=STREAM_READ_TIMEOUT_S,
+            )
 
             qimage = QImage()
-            if not qimage.loadFromData(data):
+            if not qimage.loadFromData(jpeg):
                 continue
             self.frame_ready.emit(qimage)
+            if total_frames_since_start == 0:
+                logger.info(
+                    "MJPEG first frame decoded (%dx%d, %d bytes)",
+                    qimage.width(), qimage.height(), content_length,
+                )
+            total_frames_since_start += 1
 
             frame_count += 1
             elapsed = time.time() - fps_timer
             if elapsed >= 1.0:
-                instant_fps = frame_count / elapsed
-                if smoothed_fps == 0:
-                    smoothed_fps = instant_fps
-                else:
-                    smoothed_fps = alpha * instant_fps + (1 - alpha) * smoothed_fps
+                instant = frame_count / elapsed
+                smoothed_fps = instant if smoothed_fps == 0 else (
+                    alpha * instant + (1 - alpha) * smoothed_fps
+                )
                 self.fps_updated.emit(smoothed_fps)
                 frame_count = 0
                 fps_timer = time.time()
-
-        return True
-
-    def _run_mjpeg(self, host: str, port: int) -> bool:
-        for attempt in range(3):
-            self._worker = self._start_worker(
-                "src.mjpeg_capture_worker", host, str(port),
-            )
-            if self._worker:
-                self._mode = "mjpeg"
-                logger.info("Using MJPEG capture (host=%s port=%d)", host, port)
-                clean_exit = self._stream_from_worker()
-                self._stop_worker()
-                if not self._running or clean_exit:
-                    return True
-                logger.warning("MJPEG worker died, restarting...")
-                continue
-            time.sleep(2)
-        logger.warning("MJPEG capture unavailable")
-        return False
-
-    def _run_dvt_subprocess(self, udid: str) -> bool:
-        self._worker = self._start_worker("src.capture_worker", udid)
-        if not self._worker:
-            return False
-        self._mode = "dvt-subprocess"
-        logger.info("Using DVT subprocess capture (fallback)")
-        while self._running:
-            clean = self._stream_from_worker()
-            self._stop_worker()
-            if not self._running or clean:
-                return True
-            logger.warning("DVT worker died, restarting")
-            self._worker = self._start_worker("src.capture_worker", udid)
-            if not self._worker:
-                return False
-        return True
-
-    def _run_dvt_inline(self):
-        self._mode = "dvt-inline"
-        logger.info("Using DVT inline capture (final fallback)")
-        frame_count = 0
-        fps_timer = time.time()
-        consecutive_errors = 0
-
-        while self._running:
-            if self._paused:
-                time.sleep(0.1)
-                continue
-
-            try:
-                screenshot_bytes = self._device_manager.take_screenshot()
-                qimage = QImage()
-                if not qimage.loadFromData(screenshot_bytes):
-                    continue
-                self.frame_ready.emit(qimage)
-
-                frame_count += 1
-                elapsed = time.time() - fps_timer
-                if elapsed >= 2.0:
-                    self.fps_updated.emit(frame_count / elapsed)
-                    frame_count = 0
-                    fps_timer = time.time()
-
-                consecutive_errors = 0
-
-            except ConnectionError as e:
-                logger.error("Connection error in capture: %s", e)
-                self.capture_error.emit(str(e))
-                self._running = False
-                break
-
-            except Exception as e:
-                consecutive_errors += 1
-                if consecutive_errors >= 10:
-                    self.capture_error.emit(f"Too many errors: {e}")
-                    self._running = False
-                    break
-                time.sleep(0.5)
-
-    def _stop_worker(self):
-        if not self._worker:
-            return
-        import os
-        import signal
-        proc = self._worker
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-        except Exception:
-            try:
-                proc.terminate()
-            except Exception:
-                pass
-        try:
-            proc.wait(timeout=2)
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-        self._worker = None
-
-    def stop(self):
-        self._running = False
-        self._stop_worker()
-        self.wait(5000)
