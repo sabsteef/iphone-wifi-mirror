@@ -10,11 +10,11 @@ from PyQt6.QtCore import QObject, QPointF, QTimer, pyqtSignal
 
 logger = logging.getLogger(__name__)
 
-# Empirical compensation for the WDA tap y-space overshoot on iPhone 17
-# Pro Max + iOS 27: horizontal lines land progressively BELOW the mouse
-# cursor as y grows. A linear shrink fixes it because the drift is
-# proportional to frac_y. Overridable via config or env var; see
-# src/user_config.py.
+# Tap coordinate scaling. Historically a linear shrink was needed
+# because stock WDA reported a stale screen size (390x844 on
+# iPhone 17 Pro Max). Our patched WDA reports the real UIScreen size,
+# so the default is now 1.0 (no compensation). Still overridable via
+# config/env for unpatched WDA installs or fine-tuning per device.
 from src.user_config import get_tap_x_scale, get_tap_y_scale
 TAP_Y_SCALE = get_tap_y_scale()
 TAP_X_SCALE = get_tap_x_scale()

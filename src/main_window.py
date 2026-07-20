@@ -913,6 +913,10 @@ class MainWindow(QMainWindow):
             logger.info("WDA connected — touch control enabled")
 
     def _keep_alive(self):
+        # No-op. XCTest synthetic touches don't reset iOS's auto-lock
+        # timer (that watches for HID events, not XCTest input). For
+        # long sessions, disable Auto-Lock manually via
+        # Settings → Display & Brightness → Auto-Lock → Never.
         pass
 
     def _update_battery(self):

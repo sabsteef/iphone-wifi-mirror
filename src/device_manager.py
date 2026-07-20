@@ -373,9 +373,13 @@ class DeviceManager(QObject):
             self.WDA_BUNDLE_ID,
             "--userspace",
             "--udid", self._current_udid,
+            # MJPEG tuning: 30 fps looks great in practice. It briefly
+            # stalls when WiFi bandwidth peaks, but our reconnect
+            # supervisor in screen_capture.py picks it up within ~2s —
+            # net UX is smooth. Keep it high.
             "--env", "MJPEG_SERVER_SCREENSHOT_QUALITY=55",
             "--env", "MJPEG_SCALING_FACTOR=50",
-            "--env", "MJPEG_SERVER_FRAMERATE=12",
+            "--env", "MJPEG_SERVER_FRAMERATE=30",
         ]
         if auth_token:
             cmd.extend(["--env", f"WDA_AUTH_TOKEN={auth_token}"])

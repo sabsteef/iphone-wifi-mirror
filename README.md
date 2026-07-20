@@ -282,6 +282,14 @@ Older versions had a Unicode-Private-Use-Area bug where WebDriver key codes (`�
 
 Recent WDA builds route drags through `wda/dragfromtoforduration`, which has a linear y-drift on iPhone 17. This project routes drags through the W3C `/actions` endpoint instead — same coord semantics as `/wda/tap`, so lines land where you drag.
 
+### iPhone keeps locking mid-session
+
+iOS's auto-lock timer only resets on real HID touch events; the WebDriverAgent / XCTest synthetic taps don't count. For long mirroring sessions, disable auto-lock on the iPhone:
+
+**Settings → Display & Brightness → Auto-Lock → Never**
+
+Remember to switch it back when you're done — otherwise the phone stays awake and burns battery.
+
 ### Where are the logs?
 
 Every launch appends to `~/Library/Logs/iPhoneMirror.log` (rotated at ~5 MB). If something goes wrong, `tail -f ~/Library/Logs/iPhoneMirror.log` is where to look.

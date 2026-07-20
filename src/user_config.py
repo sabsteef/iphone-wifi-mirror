@@ -33,7 +33,9 @@ _TEMPLATE = {
     "_comment": (
         "Set wda_bundle_id to the runner bundle ID you signed in Xcode, "
         "including the '.xctrunner' suffix (e.g. "
-        "com.jdoe.WebDriverAgentRunner.xctrunner). See README.md."
+        "com.jdoe.WebDriverAgentRunner.xctrunner). See README.md. "
+        "tap_*_scale should be 1.0 with the patched WDA; only tweak if "
+        "you're running upstream WDA and see tap drift."
     ),
 }
 
