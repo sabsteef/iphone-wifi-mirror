@@ -53,31 +53,7 @@ You do **not** need:
 
 The setup has three parts. The first two you do **once**. The third — signing WebDriverAgent — needs to be redone every ~7 days if you're on the free Apple Developer tier (that's Apple's certificate expiry, not ours).
 
-### Build the Mac app yourself (optional)
-
-If you want to build your own `.app` bundle from source instead of using the Homebrew Cask above (e.g. after code changes), do this after `./install.sh`:
-
-```bash
-./.venv/bin/pip install py2app
-./.venv/bin/python setup.py py2app
-cp -R "dist/iPhone Mirror.app" /Applications/
-```
-
-The resulting bundle is ~410 MB (it includes a full Python + PyQt6 runtime).
-
-### Part 1 — Install the Mac app
-
-**Option A — Homebrew (recommended, one command):**
-
-```bash
-brew tap sabsteef/tap
-brew trust sabsteef/tap        # tap is not the official homebrew-cask repo
-brew install --cask iphone-wifi-mirror
-```
-
-That drops `iPhone Mirror.app` straight into `/Applications`. Because the bundle is ad-hoc signed (no paid Apple Developer subscription used), macOS Gatekeeper may prompt to right-click → **Open** on first launch — once. Everything else about the setup below is the same.
-
-**Option B — build from source:**
+### Part 1 — Prepare the Mac
 
 ```bash
 git clone https://github.com/sabsteef/iphone-wifi-mirror.git
@@ -85,7 +61,9 @@ cd iphone-wifi-mirror
 ./install.sh
 ```
 
-The installer installs Homebrew (if missing), Python 3.14, a `.venv/`, and the Python dependencies. Launch with `./run.sh`. No admin password required.
+The installer installs Homebrew (if missing), Python 3.14, a `.venv/`, and the Python dependencies. Launch later with `./run.sh`. No admin password required.
+
+> **Why no `.app` bundle or Homebrew Cask?** py2app + Python 3.14 currently misbehaves, and a PyInstaller `.app` needs paid-account notarization to escape Gatekeeper cleanly. Running from source is what actually works today. If you want a shortcut, alias `./run.sh` in your shell rc.
 
 ### Part 2 — Pair your iPhone
 
@@ -166,21 +144,25 @@ You only need to do this once per Apple ID per iPhone.
 
 ### Part 4 — Point the app at your bundle ID
 
-The mirror app needs to know which bundle ID you chose in Part 3. Set it **once** in the config file so both `./run.sh` (Terminal) and the `/Applications/iPhone Mirror.app` (Finder) can find it — a Finder-launched app doesn't inherit your shell environment.
+The mirror app needs to know which bundle ID you chose in Part 3. Either:
 
-Create `~/.config/iphone-mirror/config.json`:
+- **Env var** (per shell session):
+  ```bash
+  export WDA_BUNDLE_ID="com.jdoe.WebDriverAgentRunner.xctrunner"
+  ```
+  Add the line to `~/.zshrc` so it persists.
 
-```json
-{
-  "wda_bundle_id": "com.jdoe.WebDriverAgentRunner.xctrunner",
-  "tap_y_scale": 0.95,
-  "tap_x_scale": 1.0
-}
-```
+- **Config file** (persistent, no shell needed) — create `~/.config/iphone-mirror/config.json`:
+  ```json
+  {
+    "wda_bundle_id": "com.jdoe.WebDriverAgentRunner.xctrunner",
+    "tap_y_scale": 0.95,
+    "tap_x_scale": 1.0
+  }
+  ```
+  The first launch creates this file as a template if missing.
 
 Note the **`.xctrunner`** suffix — that's what Xcode adds to the WebDriverAgentRunner build. If you used `com.jdoe.WebDriverAgentRunner` as bundle ID in Xcode, the runtime bundle is `com.jdoe.WebDriverAgentRunner.xctrunner`.
-
-If the file doesn't exist yet, the first launch creates a template you can edit. The `WDA_BUNDLE_ID` environment variable still wins if set (handy for quick tests from a shell).
 
 ### Part 5 — Launch
 
