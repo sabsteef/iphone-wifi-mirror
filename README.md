@@ -53,7 +53,18 @@ You do **not** need:
 
 The setup has three parts. The first two you do **once**. The third — signing WebDriverAgent — needs to be redone every ~7 days if you're on the free Apple Developer tier (that's Apple's certificate expiry, not ours).
 
-### Part 1 — Prepare the Mac
+### Part 1 — Install the Mac app
+
+**Option A — Prebuilt `.app` (easiest):**
+
+1. Download the latest [`iPhone-Mirror-*.zip`](https://github.com/sabsteef/iphone-wifi-mirror/releases/latest)
+2. Unzip and drag `iPhone Mirror.app` into `/Applications`
+3. **First launch: right-click → Open** (ad-hoc signed; needed once). If Gatekeeper is stubborn:
+   ```bash
+   xattr -dr com.apple.quarantine "/Applications/iPhone Mirror.app"
+   ```
+
+**Option B — Source install** (for contributors, or if the prebuilt doesn't fit your macOS):
 
 ```bash
 git clone https://github.com/sabsteef/iphone-wifi-mirror.git
@@ -61,9 +72,7 @@ cd iphone-wifi-mirror
 ./install.sh
 ```
 
-The installer installs Homebrew (if missing), Python 3.14, a `.venv/`, and the Python dependencies. Launch later with `./run.sh`. No admin password required.
-
-> **Why no `.app` bundle or Homebrew Cask?** py2app + Python 3.14 currently misbehaves, and a PyInstaller `.app` needs paid-account notarization to escape Gatekeeper cleanly. Running from source is what actually works today. If you want a shortcut, alias `./run.sh` in your shell rc.
+Installs Homebrew (if missing), Python 3.14, a `.venv/`, and the Python dependencies. Launch later with `./run.sh`. No admin password required.
 
 ### Part 2 — Pair your iPhone
 
