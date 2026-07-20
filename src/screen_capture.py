@@ -1,60 +1,67 @@
-"""Screen capture pipeline (v9-compatible).
+"""In-process async MJPEG capture over the v9 userspace tunnel.
 
-Design: capture happens in a *subprocess*, not in a Qt thread.
+Design notes:
 
-Rationale (unchanged from v7): pymobiledevice3 DVT calls (and MJPEG socket
-reads under load) hold the GIL for hundreds of ms at a time. In-process that
-starves the Qt UI, leading to stuttering, dropped frames on click, and janky
-scroll. A separate Python process solves this by design — the GIL contention
-is gone and IPC over a length-prefixed stdout pipe is cheap.
+v9's :class:`pymobiledevice3.remote.userspace_tunnel.UserspaceRsdTunnel`
+runs a pure-Python TCP/IP stack **inside the current process**. Its RSD
+IPv6 address is reachable **only from that same process** — a subprocess
+gets ``[Errno 65] No route to host`` when it tries to connect. That
+invalidates the v7 pattern of "spawn a subprocess to keep DVT calls off
+the Qt GIL": the subprocess can't reach the tunnel at all.
 
-Three modes, tried in order:
-    1. **MJPEG subprocess** (preferred) — talks to WDA's MJPEG server on port
-       9100 via the developer tunnel. ~10-15 FPS with tunable quality/scale.
-       We just need the tunnel IPv6 host — the worker knows nothing about
-       pymobiledevice3.
-    2. **DVT subprocess** — DVT ``Screenshot`` service. ~2 FPS but works
-       without WDA (fallback when MJPEG can't connect).
-    3. **DVT inline** — final fallback, DVT called in-process. Only used when
-       subprocess spawn itself fails.
+So we do the reads on the main process, on the qasync event loop, using
+async sockets. That works because:
 
-The DVT worker is not yet ported to v9. The MJPEG worker doesn't need
-pymobiledevice3 at all, so it works unchanged.
+* MJPEG is I/O-bound. `asyncio.open_connection` / `StreamReader.read` do
+  not hold the GIL while waiting on the socket, so the Qt UI paints
+  freely between frames.
+* JPEG decoding happens in Qt's C++ side via ``QImage.loadFromData``,
+  which releases the GIL for the decode step.
+
+This module exposes a Qt-friendly object that emits :attr:`frame_ready`
+and :attr:`fps_updated` signals from an asyncio task on the qasync loop.
 """
-
 from __future__ import annotations
 
+import asyncio
 import logging
-import os
 import re
-import signal
-import struct
-import subprocess
-import sys
 import time
 from typing import Optional
 
-from PyQt6.QtCore import QThread, pyqtSignal
+from PyQt6.QtCore import QObject, pyqtSignal
 from PyQt6.QtGui import QImage
 
 logger = logging.getLogger(__name__)
 
+BOUNDARY = b"--BoundaryString"
+READ_BUFFER = 65536
+MAX_FRAME_BYTES = 50_000_000
+CONNECT_RETRY_DELAY_S = 1.0
+CONNECT_MAX_ATTEMPTS = 30
 
-class ScreenCaptureThread(QThread):
+
+class ScreenCaptureThread(QObject):
+    """Compatibility name — used to be a QThread, now an asyncio task owner.
+
+    The public surface (`frame_ready`, `fps_updated`, `capture_error`,
+    `start`, `stop`, `pause`, `resume`) is preserved so main_window.py
+    doesn't need changes.
+    """
+
     frame_ready = pyqtSignal(QImage)
     fps_updated = pyqtSignal(float)
     capture_error = pyqtSignal(str)
 
     MJPEG_PORT = 9100
 
-    def __init__(self, device_manager, target_fps: int = 30):
-        super().__init__()
+    def __init__(self, device_manager, target_fps: int = 30, parent: Optional[QObject] = None):
+        super().__init__(parent)
         self._device_manager = device_manager
-        self._running = False
         self._target_fps = target_fps
         self._paused = False
-        self._worker: Optional[subprocess.Popen] = None
-        self._mode = "mjpeg"
+        self._running = False
+        self._task: Optional[asyncio.Task] = None
 
     # ─────────────────────────── public controls ─────────────────────────────
 
@@ -64,29 +71,44 @@ class ScreenCaptureThread(QThread):
     def resume(self) -> None:
         self._paused = False
 
+    def start(self) -> None:
+        """Kick off the async capture task on the running qasync loop."""
+        if self._task and not self._task.done():
+            return
+        self._running = True
+        self._task = asyncio.ensure_future(self._run())
+        self._task.add_done_callback(self._on_task_done)
+
+    # QThread parity — old code called .isRunning() / .stop() / .wait()
+    def isRunning(self) -> bool:
+        return self._running and self._task is not None and not self._task.done()
+
     def stop(self) -> None:
         self._running = False
-        self._stop_worker()
-        self.wait(5000)
+        task = self._task
+        if task is None or task.done():
+            return
+        task.cancel()
 
-    # ─────────────────────────── QThread entry ───────────────────────────────
+    def wait(self, ms: int = 5000) -> None:
+        """QThread parity no-op: callers already ran ``stop()``.
 
-    def run(self) -> None:
-        self._running = True
-        logger.info("Screen capture started")
+        The event-loop-based teardown drains via cancellation; there's
+        nothing meaningful to block on from a Qt slot without stalling
+        the loop that would run the cleanup.
+        """
+        return None
 
-        udid = self._device_manager._current_udid
-        host = self._extract_host()
-        if host and self._run_mjpeg(host, self.MJPEG_PORT):
-            pass
-        elif udid and self._run_dvt_subprocess(udid):
-            pass
-        else:
-            self._run_dvt_inline()
+    # ─────────────────────────── internal ────────────────────────────────────
 
-        logger.info("Screen capture stopped")
-
-    # ─────────────────────────── helpers ─────────────────────────────────────
+    def _on_task_done(self, task: asyncio.Task) -> None:
+        if task.cancelled():
+            logger.info("Screen capture cancelled")
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error("Screen capture task crashed: %s", exc, exc_info=exc)
+            self.capture_error.emit(str(exc))
 
     def _extract_host(self) -> Optional[str]:
         url = self._device_manager.get_wda_url()
@@ -98,60 +120,58 @@ class ScreenCaptureThread(QThread):
             return m.group(1)
         return None
 
-    def _start_worker(self, module: str, *args: str) -> Optional[subprocess.Popen]:
-        cmd = [sys.executable, "-m", module, *args]
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                bufsize=0,
-                start_new_session=True,
-            )
-            ready_line = proc.stdout.readline()
-            if ready_line.strip() == b"READY":
-                logger.info("%s started (PID %d)", module, proc.pid)
-                return proc
+    async def _run(self) -> None:
+        logger.info("Screen capture started (in-process, async)")
+        host = self._extract_host()
+        if not host:
+            logger.error("No WDA host available — cannot start MJPEG stream")
+            self.capture_error.emit("Geen tunnel adres — kan MJPEG niet starten")
+            return
 
-            stderr_out = b""
+        # Keep retrying the connect until WDA is up — its MJPEG server on
+        # port 9100 only starts listening once the xcuitest runner has
+        # bootstrapped inside iOS, which takes 5-15s after we spawned it.
+        reader = writer = None
+        for attempt in range(1, CONNECT_MAX_ATTEMPTS + 1):
+            if not self._running:
+                return
             try:
-                proc.wait(timeout=3)
-                stderr_out = proc.stderr.read()
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(host, self.MJPEG_PORT),
+                    timeout=5.0,
+                )
+                logger.info("MJPEG connected on attempt %d (%s:%d)", attempt, host, self.MJPEG_PORT)
+                break
+            except (OSError, asyncio.TimeoutError) as e:
+                logger.debug("MJPEG connect attempt %d/%d failed: %s", attempt, CONNECT_MAX_ATTEMPTS, e)
+                await asyncio.sleep(CONNECT_RETRY_DELAY_S)
+        else:
+            logger.error("MJPEG connect gave up after %d attempts", CONNECT_MAX_ATTEMPTS)
+            self.capture_error.emit("MJPEG server niet bereikbaar — WDA niet gestart?")
+            return
+
+        try:
+            await self._stream(reader, writer)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error("MJPEG stream error: %s", e, exc_info=e)
+            self.capture_error.emit(f"MJPEG fout: {e}")
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
             except Exception:
                 pass
-            logger.warning(
-                "%s failed (handshake=%r):\n%s",
-                module,
-                ready_line,
-                stderr_out.decode(errors="replace")[-2000:],
-            )
-            proc.kill()
-            return None
-        except Exception as e:
-            logger.warning("Failed to start %s: %s", module, e)
-            return None
 
-    def _read_frame(self, proc: subprocess.Popen) -> Optional[bytes]:
-        header = b""
-        while len(header) < 4:
-            chunk = proc.stdout.read(4 - len(header))
-            if not chunk:
-                return None
-            header += chunk
+    async def _stream(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        # Kick the WDA server so it starts sending frames.
+        writer.write(b"GET / HTTP/1.0\r\n\r\n")
+        await writer.drain()
 
-        length = struct.unpack(">I", header)[0]
-        if length > 50_000_000:
-            return None
+        # Consume the HTTP response headers and land at the first --Boundary.
+        await reader.readuntil(b"\r\n\r\n")
 
-        data = b""
-        while len(data) < length:
-            chunk = proc.stdout.read(length - len(data))
-            if not chunk:
-                return None
-            data += chunk
-        return data
-
-    def _stream_from_worker(self) -> bool:
         frame_count = 0
         fps_timer = time.time()
         smoothed_fps = 0.0
@@ -159,16 +179,47 @@ class ScreenCaptureThread(QThread):
 
         while self._running:
             if self._paused:
-                time.sleep(0.1)
+                await asyncio.sleep(0.1)
                 continue
-            if self._worker.poll() is not None:
-                return False
-            data = self._read_frame(self._worker)
-            if data is None:
-                return False
+
+            # Advance to next multipart boundary.
+            try:
+                await reader.readuntil(BOUNDARY)
+            except asyncio.IncompleteReadError:
+                logger.warning("MJPEG stream ended (server closed)")
+                return
+
+            # Optional trailing \r\n after the boundary
+            peek = await reader.readexactly(2)
+            if peek != b"\r\n":
+                # not the expected separator; feed back? readuntil already
+                # consumed BOUNDARY so we can't put bytes back, but part
+                # headers always start with a name — fall through and let
+                # the header parse below re-sync on \r\n\r\n.
+                # Prepend what we grabbed by reading into a buffer.
+                header_start = peek
+            else:
+                header_start = b""
+
+            headers_bytes = header_start + await reader.readuntil(b"\r\n\r\n")
+
+            # Parse Content-Length
+            content_length = None
+            for line in headers_bytes.split(b"\r\n"):
+                if line.lower().startswith(b"content-length:"):
+                    try:
+                        content_length = int(line.split(b":", 1)[1].strip())
+                    except ValueError:
+                        pass
+                    break
+            if content_length is None or content_length <= 0 or content_length > MAX_FRAME_BYTES:
+                logger.warning("Missing/invalid Content-Length in MJPEG part; resyncing")
+                continue
+
+            jpeg = await reader.readexactly(content_length)
 
             qimage = QImage()
-            if not qimage.loadFromData(data):
+            if not qimage.loadFromData(jpeg):
                 continue
             self.frame_ready.emit(qimage)
 
@@ -182,73 +233,3 @@ class ScreenCaptureThread(QThread):
                 self.fps_updated.emit(smoothed_fps)
                 frame_count = 0
                 fps_timer = time.time()
-
-        return True
-
-    # ─────────────────────────── modes ───────────────────────────────────────
-
-    def _run_mjpeg(self, host: str, port: int) -> bool:
-        for attempt in range(3):
-            self._worker = self._start_worker(
-                "src.mjpeg_capture_worker", host, str(port),
-            )
-            if self._worker:
-                self._mode = "mjpeg"
-                logger.info("Using MJPEG capture (host=%s port=%d)", host, port)
-                clean = self._stream_from_worker()
-                self._stop_worker()
-                if not self._running or clean:
-                    return True
-                logger.warning("MJPEG worker died, restarting...")
-                continue
-            time.sleep(2)
-        logger.warning("MJPEG capture unavailable")
-        return False
-
-    def _run_dvt_subprocess(self, udid: str) -> bool:
-        self._worker = self._start_worker("src.capture_worker", udid)
-        if not self._worker:
-            return False
-        self._mode = "dvt-subprocess"
-        logger.info("Using DVT subprocess capture (fallback)")
-        while self._running:
-            clean = self._stream_from_worker()
-            self._stop_worker()
-            if not self._running or clean:
-                return True
-            logger.warning("DVT worker died, restarting")
-            self._worker = self._start_worker("src.capture_worker", udid)
-            if not self._worker:
-                return False
-        return True
-
-    def _run_dvt_inline(self) -> None:
-        self._mode = "dvt-inline"
-        logger.info("Using DVT inline capture (final fallback — expect stutter)")
-        logger.warning(
-            "Inline DVT is not implemented in v9 yet — capture disabled."
-        )
-        self.capture_error.emit(
-            "Screen capture unavailable: MJPEG failed and DVT inline not supported in v9."
-        )
-        self._running = False
-
-    def _stop_worker(self) -> None:
-        if not self._worker:
-            return
-        proc = self._worker
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-        except Exception:
-            try:
-                proc.terminate()
-            except Exception:
-                pass
-        try:
-            proc.wait(timeout=2)
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-        self._worker = None
