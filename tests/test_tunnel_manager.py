@@ -28,6 +28,15 @@ from src.tunnel_manager import (
 
 
 class FakeRsd:
+    """Matches the v9 RSD shape: get_date() is a coroutine, not sync.
+
+    This is deliberately async — the health probe in TunnelManager must
+    await it. If we made this sync, the ``run_in_executor(rsd.get_date)``
+    bug from the initial v9 migration would have slipped through the test
+    (executor scheduled the coroutine but never awaited it, and the caller
+    read an unfulfilled coroutine object as ``truthy`` → probe reported
+    healthy even when the device was gone).
+    """
     def __init__(self, udid: str = "TEST-UDID", healthy: bool = True):
         self.udid = udid
         self.product_type = "iPhone18,2"
@@ -37,7 +46,7 @@ class FakeRsd:
     def set_healthy(self, ok: bool) -> None:
         self._healthy = ok
 
-    def get_date(self) -> dt.datetime:
+    async def get_date(self) -> dt.datetime:
         if not self._healthy:
             raise RuntimeError("tunnel dead")
         return dt.datetime(2026, 7, 20)

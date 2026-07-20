@@ -177,18 +177,16 @@ class TunnelManager:
     async def _probe_health(self) -> bool:
         """Cheap tunnel-liveness probe.
 
-        Runs a lockdown ``get_date`` call in an executor with a hard timeout.
-        Returns True if the RSD answered, False otherwise.
+        In v9 the RSD accessors (``get_date``, ``get_value``, …) are
+        coroutines, so await directly — wrapping in ``run_in_executor``
+        just schedules the coroutine object without ever awaiting it,
+        making every probe pass without actually talking to the device.
         """
         rsd = self._rsd
         if rsd is None:
             return False
-        loop = asyncio.get_running_loop()
         try:
-            await asyncio.wait_for(
-                loop.run_in_executor(None, rsd.get_date),
-                timeout=HEALTH_TIMEOUT_S,
-            )
+            await asyncio.wait_for(rsd.get_date(), timeout=HEALTH_TIMEOUT_S)
             return True
         except asyncio.TimeoutError:
             logger.debug("Health probe timed out")

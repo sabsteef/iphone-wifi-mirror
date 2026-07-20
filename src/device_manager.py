@@ -222,7 +222,7 @@ class DeviceManager(QObject):
             rsd = await self._tunnel_mgr.connect(udid)
             self._current_udid = udid
             self._device_info = {
-                "name": self._safe_get_value(rsd, "DeviceName", default="iPhone"),
+                "name": await self._safe_get_value(rsd, "DeviceName", default="iPhone"),
                 "model": rsd.product_type,
                 "ios_version": rsd.product_version,
                 "udid": rsd.udid,
@@ -241,9 +241,9 @@ class DeviceManager(QObject):
             self._set_state(ConnectionState.ERROR)
             self.connection_error.emit(str(e))
 
-    def _safe_get_value(self, rsd, key: str, default: str = "") -> str:
+    async def _safe_get_value(self, rsd, key: str, default: str = "") -> str:
         try:
-            v = rsd.get_value(key=key)
+            v = await rsd.get_value(key=key)
             return v or default
         except Exception:
             return default

@@ -18,15 +18,16 @@ from src.device_manager import ConnectionState
 
 
 class FakeRsd:
+    """v9-shaped RSD: get_date and get_value are coroutines."""
     def __init__(self, udid: str = "TEST-UDID"):
         self.udid = udid
         self.product_type = "iPhone18,2"
         self.product_version = "27.0"
 
-    def get_date(self):
+    async def get_date(self):
         return dt.datetime(2026, 7, 20)
 
-    def get_value(self, key=None):
+    async def get_value(self, key=None):
         return {"DeviceName": "TestPhone"}.get(key, "")
 
 
