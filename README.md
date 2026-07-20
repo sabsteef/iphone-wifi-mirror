@@ -2,6 +2,8 @@
 
 Mirror and control your iPhone from macOS over WiFi. An open-source alternative to Apple's **iPhone Mirroring** feature, which — at time of writing — is unavailable in the European Union.
 
+> **No paid Apple Developer subscription needed.** The **free** Apple ID that comes with every iCloud account is enough to sign the on-device runner. All you need is a Mac, Xcode, and your regular Apple ID.
+
 - **Full touch control** (tap, swipe, scroll, pinch-to-zoom, drag, long-press, keyboard input, passcode unlock)
 - **No cable required** after initial pairing
 - **No sudo, no LaunchDaemons, no background services** — everything runs in-process
@@ -31,19 +33,19 @@ The friction is real: you need an **Apple Developer account** (free tier works) 
 
 ## What you'll need
 
-Before you start, make sure you have:
-
 - **Mac** running macOS 14+ (Sonoma) with **Xcode 16+** installed
 - **iPhone** running iOS 17+ (iOS 27 tested)
-- **Apple ID** signed into Xcode → **Settings → Accounts** — the free tier is enough for personal builds
-- **Homebrew** (the installer will offer to add it if missing)
+- **A regular Apple ID** signed into Xcode → **Settings → Accounts**. Any Apple ID works; the free personal-team tier is all you need.
+- **Homebrew** (the installer offers to add it if missing)
 - Both devices on the **same WiFi network**
 
 You do **not** need:
 
-- A paid Apple Developer Program subscription (free-tier signing works)
+- 💰 A paid $99/year Apple Developer Program subscription — the free personal team that comes with every Apple ID works fine
 - A jailbroken iPhone
 - Any Apple binaries — this uses reverse-engineered protocols only
+
+**Free vs paid — the only real difference:** free-team code signatures expire every **7 days**. That means you rebuild + reinstall the WebDriverAgent runner once a week (~2 minutes). A paid account extends that to 1 year. For personal use, weekly rebuilds are usually fine.
 
 ---
 
