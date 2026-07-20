@@ -126,8 +126,17 @@ class TunnelManager:
             self._health_task.cancel()
             try:
                 await self._health_task
-            except (asyncio.CancelledError, Exception):
-                pass
+            except asyncio.CancelledError:
+                # We asked the health task to cancel — that is expected.
+                # But if our *own* task was cancelled by an outer party
+                # (e.g. app shutdown), asyncio marks current_task as
+                # cancelling(): swallowing here would break the outer
+                # cancellation. Re-raise only in that case.
+                ct = asyncio.current_task()
+                if ct is not None and ct.cancelling():
+                    raise
+            except Exception as e:
+                logger.warning("Health task teardown raised: %s", e)
             self._health_task = None
 
         if self._tunnel is None:

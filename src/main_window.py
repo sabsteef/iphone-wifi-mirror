@@ -36,7 +36,7 @@ from PyQt6.QtWidgets import (
 )
 
 from src import device_models, passcode_store, wda_auth
-from src.device_manager import ConnectionState, DeviceManager
+from src.device_manager import ConnectionState, DeviceManager, _log_task_exception
 from src.input_handler import InputHandler
 from src.screen_capture import ScreenCaptureThread
 
@@ -816,7 +816,11 @@ class MainWindow(QMainWindow):
         self.input_handler.wda.set_auth_token(token)
         wda_url = self.device_manager.get_wda_url()
         self.input_handler.wda.base_url = wda_url.rstrip("/")
-        self.input_handler.try_connect_wda()
+        # WDAClient.connect makes 3 sync HTTP calls (~12s worst case). On the
+        # qasync loop that blocks paint/input and every other async task
+        # (health probe, discovery, reconnect). Push to executor.
+        loop = asyncio.get_event_loop()
+        loop.run_in_executor(None, self.input_handler.try_connect_wda)
 
     def _on_wda_status(self, connected: bool):
         self._wda_banner.setVisible(not connected)
@@ -868,7 +872,8 @@ class MainWindow(QMainWindow):
 
     def _on_reconnect(self):
         self._on_device_disconnected()
-        asyncio.ensure_future(self._async_reconnect())
+        task = asyncio.ensure_future(self._async_reconnect())
+        task.add_done_callback(_log_task_exception("manual reconnect"))
 
     async def _async_reconnect(self) -> None:
         await self.device_manager.disconnect()
@@ -880,7 +885,8 @@ class MainWindow(QMainWindow):
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
-                asyncio.ensure_future(self.async_close())
+                task = asyncio.ensure_future(self.async_close())
+                task.add_done_callback(_log_task_exception("close-event async teardown"))
         except RuntimeError:
             pass
         super().closeEvent(event)

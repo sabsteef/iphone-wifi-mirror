@@ -1,6 +1,7 @@
 import logging
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
 
 import requests
@@ -16,9 +17,28 @@ class GestureState(Enum):
     LONG_PRESSING = 3
 
 
+# Bounded pool for WDA HTTP calls. Every keystroke, tap, swipe, and pinch
+# hits WDA over HTTP with a shared session lock, so unbounded threads pile
+# up behind the lock on any slow round-trip. Two workers is enough because
+# _post is serialized by self._lock anyway; the pool is really there to
+# cap thread creation and let exceptions surface via Future.
+_WDA_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="wda")
+
+
 def _fire_and_forget(fn):
-    thread = threading.Thread(target=fn, daemon=True)
-    thread.start()
+    """Dispatch a blocking WDA HTTP call on the bounded pool.
+
+    Logs exceptions instead of swallowing them so a broken tap doesn't
+    disappear silently.
+    """
+    fut = _WDA_POOL.submit(fn)
+
+    def _log_exc(f):
+        exc = f.exception()
+        if exc is not None:
+            logger.warning("WDA background call failed: %s", exc)
+
+    fut.add_done_callback(_log_exc)
 
 
 class WDAClient:

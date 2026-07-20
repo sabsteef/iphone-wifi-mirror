@@ -52,6 +52,22 @@ class ConnectionState(Enum):
     ERROR = 3
 
 
+def _log_task_exception(label: str):
+    """Return a Task done-callback that logs exceptions with a label.
+
+    ``asyncio.ensure_future(coro)`` without a stored reference silently
+    swallows exceptions until GC time. Attach this callback so any
+    coroutine failure shows up in the log immediately with context.
+    """
+    def _cb(task: asyncio.Task) -> None:
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error("%s failed: %s", label, exc, exc_info=exc)
+    return _cb
+
+
 class DeviceManager(QObject):
     device_connected = pyqtSignal(dict)
     device_disconnected = pyqtSignal()
@@ -105,7 +121,12 @@ class DeviceManager(QObject):
                 "Preferred device changed (%s -> %s), disconnecting to switch",
                 prev, self._preferred_udid,
             )
-            asyncio.ensure_future(self.disconnect())
+            # Cancel any in-flight switch so rapid combo changes don't stack.
+            prior = getattr(self, "_switch_task", None)
+            if prior is not None and not prior.done():
+                prior.cancel()
+            self._switch_task = asyncio.ensure_future(self.disconnect())
+            self._switch_task.add_done_callback(_log_task_exception("device-switch disconnect"))
 
     def get_wda_url(self) -> str:
         rsd = self._tunnel_mgr.rsd
@@ -272,22 +293,41 @@ class DeviceManager(QObject):
             cmd.extend(["--env", f"WDA_AUTH_TOKEN={auth_token}"])
             logger.info("WDA will require auth token")
 
+        # Log to a temp file so early-exit diagnostics survive, but we do NOT
+        # keep a PIPE open — after ~64 KiB of xcuitest log, pymobiledevice3
+        # would block on write() and WDA would freeze after a few minutes
+        # with no obvious cause in our own log.
+        import tempfile
+        wda_log = tempfile.NamedTemporaryFile(
+            mode="w+b", prefix="wda-", suffix=".log", delete=False,
+        )
+        self._wda_log_path = wda_log.name
         try:
             self._wda_proc = subprocess.Popen(
                 cmd,
-                stdout=subprocess.PIPE,
+                stdout=wda_log,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
             time.sleep(5)
             if self._wda_proc.poll() is not None:
-                output = (self._wda_proc.stdout.read() or b"").decode(errors="replace")
+                wda_log.seek(0)
+                output = (wda_log.read() or b"").decode(errors="replace")
+                wda_log.close()
                 logger.error("WDA exited early: %s", output[-500:])
                 self._wda_proc = None
                 return False
-            logger.info("WDA xcuitest started (PID %d)", self._wda_proc.pid)
+            wda_log.close()  # subprocess still holds its own dup'd fd
+            logger.info(
+                "WDA xcuitest started (PID %d, log: %s)",
+                self._wda_proc.pid, self._wda_log_path,
+            )
             return True
         except Exception as e:
+            try:
+                wda_log.close()
+            except Exception:
+                pass
             logger.error("Failed to start WDA: %s", e)
             return False
 
